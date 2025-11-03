@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import harmonypy as hm
 
 from scmodal.networks import *
 from scmodal.utils import *
@@ -14,7 +15,8 @@ from scmodal.utils import *
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
-                 model_path="models", data_path="data", result_path="results"):
+                 model_path="models", data_path="data", result_path="results", 
+                 use_harmony=True, harmony_max_iter_harmony=20, harmony_sigma=0.1, harmony_theta=2.0):
 
         # add device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -38,7 +40,50 @@ class Model(object):
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
+        
+        # Harmony parameters
+        self.use_harmony = use_harmony
+        self.harmony_max_iter_harmony = harmony_max_iter_harmony
+        self.harmony_sigma = harmony_sigma
+        self.harmony_theta = harmony_theta
 
+    def _harmonize_embeddings(self, embeddings, batch_labels):
+        """Apply Harmony batch correction to embeddings"""
+        if not self.use_harmony:
+            return embeddings
+            
+        try:
+            # Run Harmony
+            ho = hm.run_harmony(
+                embeddings, 
+                batch_labels, 
+                max_iter_harmony=self.harmony_max_iter_harmony,
+                sigma=self.harmony_sigma,
+                theta=self.harmony_theta
+            )
+            return ho.Z_corr.T  # Return harmonized embeddings
+        except Exception as e:
+            print(f"Warning: Harmony failed with error {e}. Using original embeddings.")
+            return embeddings
+
+    def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
+        """Get MNN pairs using harmonized embeddings"""
+        if not self.use_harmony:
+            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
+            
+        # Combine features and batch labels
+        combined_feats = np.vstack([feat_A, feat_B])
+        combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
+        
+        # Apply Harmony
+        harmonized_feats = self._harmonize_embeddings(combined_feats, combined_batches)
+        
+        # Split back into A and B
+        harmonized_A = harmonized_feats[:len(feat_A)]
+        harmonized_B = harmonized_feats[len(feat_A):]
+        
+        # Get MNN pairs on harmonized embeddings
+        return acquire_pairs(harmonized_A, harmonized_B, k=self.n_KNN)
 
     def preprocess(self, 
                    adata_A_input, 
@@ -51,6 +96,10 @@ class Model(object):
         self.shared_gene_num = shared_gene_num
         self.emb_A = self.adata_A.X
         self.emb_B = self.adata_B.X
+        
+        # Create batch labels for Harmony
+        self.batch_labels_A = np.zeros(self.emb_A.shape[0])  # Batch 0 for dataset A
+        self.batch_labels_B = np.ones(self.emb_B.shape[0])   # Batch 1 for dataset B
 
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
@@ -70,6 +119,11 @@ class Model(object):
         self.shared_gene_num = shared_gene_num
         self.emb_A = adata_A.X
         self.emb_B = adata_B.X
+        
+        # Create batch labels for Harmony
+        self.batch_labels_A = np.zeros(self.emb_A.shape[0])  # Batch 0 for dataset A
+        self.batch_labels_B = np.ones(self.emb_B.shape[0])   # Batch 1 for dataset B
+        
         if layer_adata_A_MNN is None:
             self.feat_A_MNN = self.emb_A
         else:
@@ -83,6 +137,8 @@ class Model(object):
     def train(self):
         begin_time = time.time()
         print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print(f"Using Harmony for MNN: {self.use_harmony}")
+        
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
@@ -146,8 +202,24 @@ class Model(object):
             # geometric structure loss
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
 
-            # MNN loss
-            Sim = acquire_pairs(self.emb_A[index_A, :self.shared_gene_num], self.emb_B[index_B, :self.shared_gene_num], k=self.n_KNN)
+            # MNN loss - UPDATED WITH HARMONY
+            if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
+                # Use additional features for MNN if available
+                Sim = self._get_harmonized_mnn_pairs(
+                    self.feat_A_MNN[index_A], 
+                    self.feat_B_MNN[index_B],
+                    self.batch_labels_A[index_A],
+                    self.batch_labels_B[index_B]
+                )
+            else:
+                # Use shared genes for MNN
+                Sim = self._get_harmonized_mnn_pairs(
+                    self.emb_A[index_A, :self.shared_gene_num], 
+                    self.emb_B[index_B, :self.shared_gene_num],
+                    self.batch_labels_A[index_A],
+                    self.batch_labels_B[index_B]
+                )
+            
             Sim = torch.from_numpy(Sim).float().to(self.device)
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
@@ -159,8 +231,8 @@ class Model(object):
             optimizer_G.step()
 
             if not step % 2000:
-                print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                harmony_status = " (Harmony)" if self.use_harmony else ""
+                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -231,6 +303,8 @@ class Model(object):
                                  ):
         begin_time = time.time()
         print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print(f"Using Harmony for MNN: {self.use_harmony}")
+        
         num_datasets = len(input_feats)
         assert len(feat_links_MNN) == (num_datasets-1)
         self.E_dict = {}
@@ -305,15 +379,33 @@ class Model(object):
             for i in range(num_datasets):
                 loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
 
-            # MNN loss
+            # MNN loss - UPDATED WITH HARMONY
             loss_MNN = 0
             for i in range(num_datasets-1):
                 if input_MNN != None:
-                    Sim = acquire_pairs(x_MNN_dict[i][:, feat_links_MNN[i][0]], 
-                        x_MNN_dict[i+1][:, feat_links_MNN[i][1]], k=self.n_KNN)
+                    # Create batch labels for this pair
+                    batch_labels_i = np.zeros(self.batch_size)
+                    batch_labels_i1 = np.ones(self.batch_size)
+                    
+                    # Use harmonized MNN pairs
+                    Sim = self._get_harmonized_mnn_pairs(
+                        x_MNN_dict[i][:, feat_links_MNN[i][0]], 
+                        x_MNN_dict[i+1][:, feat_links_MNN[i][1]],
+                        batch_labels_i,
+                        batch_labels_i1
+                    )
                 else:
-                    Sim = acquire_pairs(x_dict[i][:, feat_links_MNN[i][0]], 
-                        x_dict[i+1][:, feat_links_MNN[i][1]], k=self.n_KNN)
+                    # Create batch labels for this pair
+                    batch_labels_i = np.zeros(self.batch_size)
+                    batch_labels_i1 = np.ones(self.batch_size)
+                    
+                    # Use harmonized MNN pairs
+                    Sim = self._get_harmonized_mnn_pairs(
+                        x_dict[i][:, feat_links_MNN[i][0]], 
+                        x_dict[i+1][:, feat_links_MNN[i][1]],
+                        batch_labels_i,
+                        batch_labels_i1
+                    )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
                 z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
@@ -325,8 +417,8 @@ class Model(object):
             optimizer_G.step()
 
             if not step % 200:
-                print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                harmony_status = " (Harmony)" if self.use_harmony else ""
+                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -353,6 +445,8 @@ class Model(object):
                                  ):
         begin_time = time.time()
         print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print(f"Using Harmony for MNN: {self.use_harmony}")
+        
         num_datasets = len(input_feats)
         self.E_dict = {}
         self.G_dict = {}
@@ -427,10 +521,20 @@ class Model(object):
             for i in range(num_datasets):
                 loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
 
-            # MNN loss
+            # MNN loss - UPDATED WITH HARMONY
             loss_MNN = 0
             for i in range(num_datasets-1):
-                Sim = acquire_pairs(x_MNN_dict_0[i], x_MNN_dict_1[i], k=self.n_KNN)
+                # Create batch labels for this pair
+                batch_labels_0 = np.zeros(self.batch_size)
+                batch_labels_1 = np.ones(self.batch_size)
+                
+                # Use harmonized MNN pairs
+                Sim = self._get_harmonized_mnn_pairs(
+                    x_MNN_dict_0[i], 
+                    x_MNN_dict_1[i], 
+                    batch_labels_0,
+                    batch_labels_1
+                )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
                 z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
@@ -442,8 +546,8 @@ class Model(object):
             optimizer_G.step()
 
             if not step % 2000:
-                print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                harmony_status = " (Harmony)" if self.use_harmony else ""
+                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
