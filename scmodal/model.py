@@ -192,7 +192,7 @@ class Model(object):
     """Backward compatibility method - redirects to the new fast method"""
     # For multi-dataset case, we need to handle it differently
     # Since we don't have precomputed embeddings for arbitrary pairs
-    return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
+        return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
 
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
