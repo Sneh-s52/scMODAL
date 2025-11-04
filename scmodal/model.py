@@ -189,9 +189,9 @@ class Model(object):
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
 
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
-    """Backward compatibility method - redirects to the new fast method"""
-    # For multi-dataset case, we need to handle it differently
-    # Since we don't have precomputed embeddings for arbitrary pairs
+        """Backward compatibility method - redirects to the new fast method"""
+        # For multi-dataset case, we need to handle it differently
+        # Since we don't have precomputed embeddings for arbitrary pairs
         return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
 
     def preprocess_additional_inputs(self, 
