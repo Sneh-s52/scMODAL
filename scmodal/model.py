@@ -158,6 +158,42 @@ class Model(object):
         # Precompute Harmony embeddings
         self._precompute_harmony_embeddings()
 
+    def _get_harmonized_mnn_pairs_multi(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
+        """Get MNN pairs for multi-dataset case using simple batch correction"""
+        if not self.use_harmony:
+            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
+            
+        try:
+            # Convert to dense arrays if sparse
+            if hasattr(feat_A, 'toarray'):
+                feat_A = feat_A.toarray()
+            if hasattr(feat_B, 'toarray'):
+                feat_B = feat_B.toarray()
+                
+            feat_A = np.array(feat_A, dtype=np.float32)
+            feat_B = np.array(feat_B, dtype=np.float32)
+            
+            combined_feats = np.vstack([feat_A, feat_B])
+            combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
+            
+            # Use simple batch correction for multi-dataset (faster than full Harmony)
+            corrected_feats = self._simple_batch_correction(combined_feats, combined_batches)
+            
+            corrected_A = corrected_feats[:len(feat_A)]
+            corrected_B = corrected_feats[len(feat_A):]
+            
+            return acquire_pairs(corrected_A, corrected_B, k=self.n_KNN)
+            
+        except Exception as e:
+            print(f"Multi-dataset batch-corrected MNN failed: {e}")
+            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
+
+    def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
+    """Backward compatibility method - redirects to the new fast method"""
+    # For multi-dataset case, we need to handle it differently
+    # Since we don't have precomputed embeddings for arbitrary pairs
+    return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
+
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
                    adata_B_input, 
