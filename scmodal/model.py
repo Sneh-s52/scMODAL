@@ -15,7 +15,7 @@ class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
                  model_path="models", data_path="data", result_path="results", 
-                 use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0):  # Reduced iterations
+                 use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0):
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         torch.manual_seed(seed)
@@ -39,7 +39,7 @@ class Model(object):
         
         # Harmony parameters
         self.use_harmony = use_harmony
-        self.harmony_max_iter_harmony = harmony_max_iter_harmony  # Reduced from 20 to 10
+        self.harmony_max_iter_harmony = harmony_max_iter_harmony
         self.harmony_sigma = harmony_sigma
         self.harmony_theta = harmony_theta
         
@@ -60,6 +60,35 @@ class Model(object):
         except ImportError:
             print("harmonypy not available, using simple batch correction")
             return False
+
+    def _simple_batch_correction(self, embeddings, batch_labels):
+        """Simple but effective batch correction"""
+        try:
+            embeddings = np.array(embeddings, dtype=np.float32)
+            batch_labels = np.array(batch_labels)
+            
+            unique_batches = np.unique(batch_labels)
+            if len(unique_batches) <= 1:
+                return embeddings
+                
+            # Method: Remove batch means
+            batch_corrected = embeddings.copy()
+            overall_mean = np.mean(embeddings, axis=0)
+            
+            for batch in unique_batches:
+                batch_mask = batch_labels == batch
+                batch_data = embeddings[batch_mask]
+                
+                if len(batch_data) > 0:
+                    # Remove batch-specific mean
+                    batch_mean = np.mean(batch_data, axis=0)
+                    batch_corrected[batch_mask] = batch_data - batch_mean + overall_mean
+            
+            return batch_corrected
+            
+        except Exception as e:
+            print(f"Simple batch correction failed: {e}")
+            return embeddings
 
     def _precompute_harmony_embeddings(self):
         """Precompute Harmony embeddings once at the beginning"""
@@ -139,25 +168,6 @@ class Model(object):
         
         return acquire_pairs(harmony_A_batch, harmony_B_batch, k=self.n_KNN)
 
-    def preprocess(self, 
-                   adata_A_input, 
-                   adata_B_input, 
-                   shared_gene_num
-                   ):
-        self.adata_A = adata_A_input.copy()
-        self.adata_B = adata_B_input.copy()
-
-        self.shared_gene_num = shared_gene_num
-        self.emb_A = self.adata_A.X
-        self.emb_B = self.adata_B.X
-        
-        # Create batch labels for Harmony
-        self.batch_labels_A = np.zeros(self.emb_A.shape[0])
-        self.batch_labels_B = np.ones(self.emb_B.shape[0])
-        
-        # Precompute Harmony embeddings
-        self._precompute_harmony_embeddings()
-
     def _get_harmonized_mnn_pairs_multi(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
         """Get MNN pairs for multi-dataset case using simple batch correction"""
         if not self.use_harmony:
@@ -193,6 +203,25 @@ class Model(object):
         # For multi-dataset case, we need to handle it differently
         # Since we don't have precomputed embeddings for arbitrary pairs
         return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
+
+    def preprocess(self, 
+                   adata_A_input, 
+                   adata_B_input, 
+                   shared_gene_num
+                   ):
+        self.adata_A = adata_A_input.copy()
+        self.adata_B = adata_B_input.copy()
+
+        self.shared_gene_num = shared_gene_num
+        self.emb_A = self.adata_A.X
+        self.emb_B = self.adata_B.X
+        
+        # Create batch labels for Harmony
+        self.batch_labels_A = np.zeros(self.emb_A.shape[0])
+        self.batch_labels_B = np.ones(self.emb_B.shape[0])
+        
+        # Precompute Harmony embeddings
+        self._precompute_harmony_embeddings()
 
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
@@ -329,12 +358,9 @@ class Model(object):
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
 
-    # ... [REST OF YOUR METHODS STAY THE SAME] ...
-
-
     def eval(self):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
 
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
@@ -386,7 +412,7 @@ class Model(object):
                                  input_MNN=None, # A list of features matrices for finding MNN pairs between datasets; set as the same as input_feats if "input_MNN=None"
                                  ):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         num_datasets = len(input_feats)
@@ -510,7 +536,7 @@ class Model(object):
         print("Training takes %.2f seconds" % self.train_time)
 
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
 
         for i in range(num_datasets):
             self.E_dict[i].train()
@@ -528,7 +554,7 @@ class Model(object):
                                  paired_input_MNN, # In the form of [[link_feat_data1, link_feat_data2], ..., [link_feat_data(N_1), link_feat_dataN]]
                                  ):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         num_datasets = len(input_feats)
@@ -639,7 +665,7 @@ class Model(object):
         print("Training takes %.2f seconds" % self.train_time)
 
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
 
         for i in range(num_datasets):
             self.E_dict[i].train()
