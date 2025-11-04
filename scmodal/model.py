@@ -48,28 +48,31 @@ class Model(object):
         self.harmony_theta = harmony_theta
 
     def _harmonize_embeddings(self, embeddings, batch_labels):
-        """Apply Harmony batch correction to embeddings"""
+        """Simple robust Harmony integration"""
         if not self.use_harmony:
             return embeddings
             
         try:
-            # Create proper metadata DataFrame for Harmony
-            meta_data = pd.DataFrame({
-                'batch': batch_labels
-            })
+            embeddings = np.array(embeddings, dtype=np.float32)
+            batch_labels = np.array(batch_labels)
             
-            # Run Harmony with proper parameters
-            ho = hm.run_harmony(
-                embeddings, 
-                meta_data, 
-                vars_use=['batch'],  # CRITICAL FIX
-                max_iter_harmony=self.harmony_max_iter_harmony,
-                sigma=self.harmony_sigma,
-                theta=self.harmony_theta
-            )
-            return ho.Z_corr.T  # Return harmonized embeddings
+            # Quick check
+            if len(np.unique(batch_labels)) <= 1:
+                return embeddings
+                
+            # Simple approach - try both API styles
+            try:
+                # New API with DataFrame
+                meta_data = pd.DataFrame({'batch': batch_labels})
+                ho = hm.run_harmony(embeddings, meta_data, vars_use=['batch'])
+                return ho.Z_corr.T
+            except:
+                # Old API with direct labels  
+                ho = hm.run_harmony(embeddings, batch_labels)
+                return ho.Z_corr.T
+                
         except Exception as e:
-            print(f"Warning: Harmony failed with error {e}. Using original embeddings.")
+            print(f"Harmony failed, using original: {e}")
             return embeddings
     
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
