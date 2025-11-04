@@ -48,31 +48,37 @@ class Model(object):
         self.harmony_theta = harmony_theta
 
     def _harmonize_embeddings(self, embeddings, batch_labels):
-        """Simple robust Harmony integration"""
+        """Apply Harmony batch correction - FIXED VERSION"""
         if not self.use_harmony:
             return embeddings
             
         try:
+            # Convert to proper format
             embeddings = np.array(embeddings, dtype=np.float32)
             batch_labels = np.array(batch_labels)
             
-            # Quick check
-            if len(np.unique(batch_labels)) <= 1:
+            # Check if we have multiple batches
+            unique_batches = np.unique(batch_labels)
+            if len(unique_batches) <= 1:
                 return embeddings
                 
-            # Simple approach - try both API styles
-            try:
-                # New API with DataFrame
-                meta_data = pd.DataFrame({'batch': batch_labels})
-                ho = hm.run_harmony(embeddings, meta_data, vars_use=['batch'])
-                return ho.Z_corr.T
-            except:
-                # Old API with direct labels  
-                ho = hm.run_harmony(embeddings, batch_labels)
-                return ho.Z_corr.T
-                
+            # OFFICIAL HARMONYPY PATTERN
+            meta_data = pd.DataFrame({'batch': batch_labels})
+            vars_use = ['batch']  # THIS WAS THE MISSING PARAMETER
+            
+            ho = hm.run_harmony(
+                embeddings, 
+                meta_data, 
+                vars_use,  # NOW INCLUDED!
+                max_iter_harmony=self.harmony_max_iter_harmony,
+                sigma=self.harmony_sigma,
+                theta=self.harmony_theta
+            )
+            
+            return ho.Z_corr.T
+            
         except Exception as e:
-            print(f"Harmony failed, using original: {e}")
+            print(f"Harmony failed: {e}. Using original embeddings.")
             return embeddings
     
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
@@ -81,24 +87,26 @@ class Model(object):
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
             
         try:
-            # Combine features and batch labels
+            # Convert to dense arrays if sparse
+            if hasattr(feat_A, 'toarray'):
+                feat_A = feat_A.toarray()
+            if hasattr(feat_B, 'toarray'):
+                feat_B = feat_B.toarray()
+                
             combined_feats = np.vstack([feat_A, feat_B])
             combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
             
-            # Apply Harmony
             harmonized_feats = self._harmonize_embeddings(combined_feats, combined_batches)
             
-            # Split back into A and B
             harmonized_A = harmonized_feats[:len(feat_A)]
             harmonized_B = harmonized_feats[len(feat_A):]
             
-            # Get MNN pairs on harmonized embeddings
             return acquire_pairs(harmonized_A, harmonized_B, k=self.n_KNN)
             
         except Exception as e:
-            print(f"Warning: Harmonized MNN failed: {e}. Using regular MNN.")
+            print(f"Harmonized MNN failed: {e}. Using regular MNN.")
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
-
+            
     def preprocess(self, 
                    adata_A_input, 
                    adata_B_input, 
