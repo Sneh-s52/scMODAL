@@ -15,7 +15,8 @@ class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
                  model_path="models", data_path="data", result_path="results", 
-                 use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0):
+                 use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0,
+                 use_deep_cca=True, lambdaCCA=1.0, cca_dim=16, cca_hidden_dims=[64, 32], cca_mixing_ratio=0.3):
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         torch.manual_seed(seed)
@@ -43,9 +44,19 @@ class Model(object):
         self.harmony_sigma = harmony_sigma
         self.harmony_theta = harmony_theta
         
+        # Deep CCA parameters
+        self.use_deep_cca = use_deep_cca
+        self.lambdaCCA = lambdaCCA
+        self.cca_dim = cca_dim
+        self.cca_hidden_dims = cca_hidden_dims
+        self.cca_mixing_ratio = cca_mixing_ratio  # How much to mix CCA-aligned representations
+        
         # Precomputed Harmony embeddings
         self.precomputed_harmony_A = None
         self.precomputed_harmony_B = None
+        
+        # Deep CCA module (will be initialized during training)
+        self.deep_cca = None
         
         # Check if harmonypy is available
         self.harmony_available = self._check_harmony_availability()
@@ -204,6 +215,32 @@ class Model(object):
         # Since we don't have precomputed embeddings for arbitrary pairs
         return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
 
+    def _apply_deep_cca_alignment(self, z_A, z_B):
+        """Apply Deep CCA alignment to latent representations"""
+        if not self.use_deep_cca or self.deep_cca is None:
+            return z_A, z_B, torch.tensor(0.0).to(self.device)
+        
+        try:
+            # Apply Deep CCA projection
+            projected_A, projected_B = self.deep_cca(z_A, z_B)
+            
+            # Compute CCA loss
+            cca_loss = deep_cca_loss(projected_A, projected_B)
+            
+            # Compute CCA-aligned representations using traditional CCA
+            z_A_aligned, z_B_aligned = compute_cca_alignment(projected_A, projected_B, cca_dim=self.cca_dim)
+            
+            # Mix original and CCA-aligned representations
+            mixing_ratio = self.cca_mixing_ratio
+            z_A_mixed = (1 - mixing_ratio) * z_A + mixing_ratio * z_A_aligned
+            z_B_mixed = (1 - mixing_ratio) * z_B + mixing_ratio * z_B_aligned
+            
+            return z_A_mixed, z_B_mixed, cca_loss
+            
+        except Exception as e:
+            print(f"Deep CCA alignment failed: {e}")
+            return z_A, z_B, torch.tensor(0.0).to(self.device)
+
     def preprocess(self, 
                    adata_A_input, 
                    adata_B_input, 
@@ -258,6 +295,7 @@ class Model(object):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Deep CCA: {self.use_deep_cca}")
         
         # Show precomputation status
         if self.use_harmony:
@@ -271,7 +309,18 @@ class Model(object):
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.D_Z = discriminator(self.n_latent).to(self.device)
+        
+        # Initialize Deep CCA if enabled
         params_G = list(self.E_A.parameters()) + list(self.E_B.parameters()) + list(self.G_A.parameters()) + list(self.G_B.parameters())
+        if self.use_deep_cca:
+            self.deep_cca = DeepCCA(
+                latent_dim=self.n_latent,
+                cca_dim=self.cca_dim,
+                hidden_dims=self.cca_hidden_dims
+            ).to(self.device)
+            params_G += list(self.deep_cca.parameters())
+            print(f"Deep CCA initialized: latent_dim={self.n_latent}, cca_dim={self.cca_dim}")
+        
         optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
         optimizer_D = optim.Adam(list(self.D_Z.parameters()), lr=0.001, weight_decay=0.001)
         self.E_A.train()
@@ -279,6 +328,8 @@ class Model(object):
         self.G_A.train()
         self.G_B.train()
         self.D_Z.train()
+        if self.use_deep_cca:
+            self.deep_cca.train()
 
         N_A = self.emb_A.shape[0]
         N_B = self.emb_B.shape[0]
@@ -289,27 +340,39 @@ class Model(object):
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)
             x_A = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
             x_B = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
+            
+            # Get original latent representations
             z_A = self.E_A(x_A)
             z_B = self.E_B(x_B)
-            x_AtoB = self.G_B(z_A)
-            x_BtoA = self.G_A(z_B)
-            x_Arecon = self.G_A(z_A)
-            x_Brecon = self.G_B(z_B)
+            
+            # Apply Deep CCA alignment BEFORE GAN mixing
+            z_A_aligned, z_B_aligned, loss_CCA = self._apply_deep_cca_alignment(z_A, z_B)
+            
+            # Use aligned representations for subsequent computations
+            x_AtoB = self.G_B(z_A_aligned)
+            x_BtoA = self.G_A(z_B_aligned)
+            x_Arecon = self.G_A(z_A_aligned)
+            x_Brecon = self.G_B(z_B_aligned)
             z_AtoB = self.E_B(x_AtoB)
             z_BtoA = self.E_A(x_BtoA)
+            
+            # Use aligned representations for discriminator
+            z_A_for_disc = z_A_aligned
+            z_B_for_disc = z_B_aligned
+            
             K_A = torch.mean((x_A.view(self.batch_size, 1, -1) - x_A.view(1, self.batch_size, -1))**2, dim=2)
             K_A = torch.exp(-K_A/2)
-            K_B_z = torch.mean((z_B.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
+            K_B_z = torch.mean((z_B_for_disc.view(self.batch_size, 1, -1) - z_B_for_disc.view(1, self.batch_size, -1))**2, dim=2)
             K_B_z = torch.exp(-K_B_z/2)
             K_B = torch.mean((x_B.view(self.batch_size, 1, -1) - x_B.view(1, self.batch_size, -1))**2, dim=2)
             K_B = torch.exp(-K_B/2)
-            K_A_z = torch.mean((z_A.view(self.batch_size, 1, -1) - z_A.view(1, self.batch_size, -1))**2, dim=2)
+            K_A_z = torch.mean((z_A_for_disc.view(self.batch_size, 1, -1) - z_A_for_disc.view(1, self.batch_size, -1))**2, dim=2)
             K_A_z = torch.exp(-K_A_z/2)
 
             # discriminator loss:
             for _ in range(5):
                 optimizer_D.zero_grad()
-                loss_D = (torch.log(1 + torch.exp(-self.D_Z(z_A))) + torch.log(1 + torch.exp(self.D_Z(z_B)))).mean()
+                loss_D = (torch.log(1 + torch.exp(-self.D_Z(z_A_for_disc))) + torch.log(1 + torch.exp(self.D_Z(z_B_for_disc)))).mean()
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
@@ -319,12 +382,12 @@ class Model(object):
             loss_AE = loss_AE_A + loss_AE_B
 
             # latent align loss:
-            loss_LA_AtoB = torch.mean((z_A - z_AtoB)**2)
-            loss_LA_BtoA = torch.mean((z_B - z_BtoA)**2)
+            loss_LA_AtoB = torch.mean((z_A_aligned - z_AtoB)**2)
+            loss_LA_BtoA = torch.mean((z_B_aligned - z_BtoA)**2)
             loss_LA = loss_LA_AtoB + loss_LA_BtoA
 
             # generator loss
-            loss_G_GAN = -(torch.log(1 + torch.exp(-self.D_Z(z_A))) + torch.log(1 + torch.exp(self.D_Z(z_B)))).mean()
+            loss_G_GAN = -(torch.log(1 + torch.exp(-self.D_Z(z_A_for_disc))) + torch.log(1 + torch.exp(self.D_Z(z_B_for_disc)))).mean()
 
             # geometric structure loss
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
@@ -332,18 +395,25 @@ class Model(object):
             # MNN loss - FAST VERSION USING PRECOMPUTED EMBEDDINGS
             Sim = self._get_harmonized_mnn_pairs_fast(index_A, index_B)
             Sim = torch.from_numpy(Sim).float().to(self.device)
-            z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
+            z_dist = torch.mean((z_A_aligned.view(self.batch_size, 1, -1) - z_B_aligned.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
 
             optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
+            loss_G = (self.lambdaGAN * loss_G_GAN + 
+                     self.lambdaAE * loss_AE + 
+                     self.lambdaLA * loss_LA + 
+                     self.lambdaMNN * loss_MNN + 
+                     self.lambdaGeo * loss_Geo +
+                     self.lambdaCCA * loss_CCA)  # Add CCA loss
+            
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
             if not step % 2000:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
-                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
+                cca_status = " (Deep CCA)" if self.use_deep_cca else ""
+                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -355,6 +425,10 @@ class Model(object):
 
         state = {'E_A': self.E_A.state_dict(), 'E_B': self.E_B.state_dict(),
                  'G_A': self.G_A.state_dict(), 'G_B': self.G_B.state_dict()}
+        
+        # Save Deep CCA state if used
+        if self.use_deep_cca:
+            state['deep_cca'] = self.deep_cca.state_dict()
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
 
@@ -366,16 +440,34 @@ class Model(object):
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
-        self.E_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_A'])
-        self.E_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_B'])
-        self.G_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_A'])
-        self.G_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_B'])
+        
+        # Load Deep CCA if it was used during training
+        checkpoint = torch.load(os.path.join(self.model_path, "ckpt.pth"))
+        self.E_A.load_state_dict(checkpoint['E_A'])
+        self.E_B.load_state_dict(checkpoint['E_B'])
+        self.G_A.load_state_dict(checkpoint['G_A'])
+        self.G_B.load_state_dict(checkpoint['G_B'])
+        
+        if self.use_deep_cca and 'deep_cca' in checkpoint:
+            self.deep_cca = DeepCCA(
+                latent_dim=self.n_latent,
+                cca_dim=self.cca_dim,
+                hidden_dims=self.cca_hidden_dims
+            ).to(self.device)
+            self.deep_cca.load_state_dict(checkpoint['deep_cca'])
+            print("Deep CCA loaded from checkpoint")
 
         x_A = torch.from_numpy(self.emb_A).float().to(self.device)
         x_B = torch.from_numpy(self.emb_B).float().to(self.device)
 
         z_A = self.E_A(x_A)
         z_B = self.E_B(x_B)
+        
+        # Apply Deep CCA alignment during evaluation if available
+        if self.use_deep_cca and hasattr(self, 'deep_cca'):
+            z_A_aligned, z_B_aligned, _ = self._apply_deep_cca_alignment(z_A, z_B)
+            z_A = z_A_aligned
+            z_B = z_B_aligned
 
         x_AtoB = self.G_B(z_A)
         x_BtoA = self.G_A(z_B)
@@ -414,6 +506,7 @@ class Model(object):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Deep CCA: {self.use_deep_cca}")
         
         num_datasets = len(input_feats)
         assert len(feat_links_MNN) == (num_datasets-1)
@@ -425,6 +518,18 @@ class Model(object):
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
+        
+        # Initialize Deep CCA modules for each consecutive pair if enabled
+        self.deep_cca_dict = {}
+        if self.use_deep_cca:
+            for i in range(num_datasets-1):
+                self.deep_cca_dict[i] = DeepCCA(
+                    latent_dim=self.n_latent,
+                    cca_dim=self.cca_dim,
+                    hidden_dims=self.cca_hidden_dims
+                ).to(self.device)
+                params_G += list(self.deep_cca_dict[i].parameters())
+        
         optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
 
         self.D_dict = {}
@@ -439,11 +544,15 @@ class Model(object):
             self.G_dict[i].train()
         for i in range(num_datasets-1):
             self.D_dict[i].train()
+        if self.use_deep_cca:
+            for i in range(num_datasets-1):
+                self.deep_cca_dict[i].train()
 
         for step in range(self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
+            z_aligned_dict = {}  # For Deep CCA aligned representations
             K_dict = {}
             K_z_dict = {}
             if input_MNN != None:
@@ -459,30 +568,52 @@ class Model(object):
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
 
+            # Apply Deep CCA alignment for each consecutive pair
+            loss_CCA_total = torch.tensor(0.0).to(self.device)
+            if self.use_deep_cca:
+                for i in range(num_datasets-1):
+                    z_i_aligned, z_i1_aligned, loss_CCA = self._apply_deep_cca_alignment_multi(
+                        z_dict[i], z_dict[i+1], self.deep_cca_dict[i]
+                    )
+                    # Store aligned representations
+                    if i == 0:
+                        z_aligned_dict[i] = z_i_aligned
+                    z_aligned_dict[i+1] = z_i1_aligned
+                    loss_CCA_total += loss_CCA
+            else:
+                # If no Deep CCA, use original representations
+                for i in range(num_datasets):
+                    z_aligned_dict[i] = z_dict[i]
+
             # discriminator loss:
             for _ in range(5):
                 optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
-                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
+                    # Use aligned representations for discriminator
+                    z_i = z_aligned_dict[i]
+                    z_i1 = z_aligned_dict[i+1]
+                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
             # autoencoder loss:
             loss_AE = 0
             for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_dict[i]) - x_dict[i])**2)
+                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_dict[i])**2)
 
             # latent align loss:
             loss_LA = 0
             for i in range(num_datasets-1):
-                loss_LA += torch.mean((z_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_dict[i])))**2)
-                loss_LA += torch.mean((z_dict[i+1] - self.E_dict[i](self.G_dict[i](z_dict[i+1])))**2)
+                loss_LA += torch.mean((z_aligned_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_aligned_dict[i])))**2)
+                loss_LA += torch.mean((z_aligned_dict[i+1] - self.E_dict[i](self.G_dict[i](z_aligned_dict[i+1])))**2)
 
             # generator loss
             loss_G_GAN = 0
             for i in range(num_datasets-1):
-                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
+                z_i = z_aligned_dict[i]
+                z_i1 = z_aligned_dict[i+1]
+                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
 
             # geometric structure loss
             loss_Geo = 0
@@ -517,18 +648,26 @@ class Model(object):
                         batch_labels_i1
                     )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
-                z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
+                # Use aligned representations for MNN loss
+                z_dist = torch.mean((z_aligned_dict[i].view(self.batch_size, 1, -1) - z_aligned_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
             optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
+            loss_G = (self.lambdaGAN * loss_G_GAN + 
+                     self.lambdaAE * loss_AE + 
+                     self.lambdaLA * loss_LA + 
+                     self.lambdaMNN * loss_MNN + 
+                     self.lambdaGeo * loss_Geo +
+                     self.lambdaCCA * loss_CCA_total)  # Add CCA loss
+            
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
             if not step % 200:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
-                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
+                cca_status = " (Deep CCA)" if self.use_deep_cca else ""
+                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -548,6 +687,31 @@ class Model(object):
 
         self.latent = np.concatenate([z_dict[i].detach().cpu().numpy() for i in range(num_datasets)], axis=0)
 
+    def _apply_deep_cca_alignment_multi(self, z_A, z_B, deep_cca_module):
+        """Apply Deep CCA alignment for multi-dataset case"""
+        if not self.use_deep_cca or deep_cca_module is None:
+            return z_A, z_B, torch.tensor(0.0).to(self.device)
+        
+        try:
+            # Apply Deep CCA projection
+            projected_A, projected_B = deep_cca_module(z_A, z_B)
+            
+            # Compute CCA loss
+            cca_loss = deep_cca_loss(projected_A, projected_B)
+            
+            # Compute CCA-aligned representations using traditional CCA
+            z_A_aligned, z_B_aligned = compute_cca_alignment(projected_A, projected_B, cca_dim=self.cca_dim)
+            
+            # Mix original and CCA-aligned representations
+            mixing_ratio = self.cca_mixing_ratio
+            z_A_mixed = (1 - mixing_ratio) * z_A + mixing_ratio * z_A_aligned
+            z_B_mixed = (1 - mixing_ratio) * z_B + mixing_ratio * z_B_aligned
+            
+            return z_A_mixed, z_B_mixed, cca_loss
+            
+        except Exception as e:
+            print(f"Deep CCA alignment failed: {e}")
+            return z_A, z_B, torch.tensor(0.0).to(self.device)
 
     def integrate_datasets_feats(self, # Use this function for N >= 3 datasets when provided linked features for MNN
                                  input_feats,
@@ -556,6 +720,7 @@ class Model(object):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Deep CCA: {self.use_deep_cca}")
         
         num_datasets = len(input_feats)
         self.E_dict = {}
@@ -566,6 +731,18 @@ class Model(object):
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
+        
+        # Initialize Deep CCA modules for each consecutive pair if enabled
+        self.deep_cca_dict = {}
+        if self.use_deep_cca:
+            for i in range(num_datasets-1):
+                self.deep_cca_dict[i] = DeepCCA(
+                    latent_dim=self.n_latent,
+                    cca_dim=self.cca_dim,
+                    hidden_dims=self.cca_hidden_dims
+                ).to(self.device)
+                params_G += list(self.deep_cca_dict[i].parameters())
+        
         optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
 
         self.D_dict = {}
@@ -580,11 +757,15 @@ class Model(object):
             self.G_dict[i].train()
         for i in range(num_datasets-1):
             self.D_dict[i].train()
+        if self.use_deep_cca:
+            for i in range(num_datasets-1):
+                self.deep_cca_dict[i].train()
 
         for step in range(self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
+            z_aligned_dict = {}  # For Deep CCA aligned representations
             K_dict = {}
             K_z_dict = {}
             assert len(paired_input_MNN) == (num_datasets - 1)
@@ -601,30 +782,52 @@ class Model(object):
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
 
+            # Apply Deep CCA alignment for each consecutive pair
+            loss_CCA_total = torch.tensor(0.0).to(self.device)
+            if self.use_deep_cca:
+                for i in range(num_datasets-1):
+                    z_i_aligned, z_i1_aligned, loss_CCA = self._apply_deep_cca_alignment_multi(
+                        z_dict[i], z_dict[i+1], self.deep_cca_dict[i]
+                    )
+                    # Store aligned representations
+                    if i == 0:
+                        z_aligned_dict[i] = z_i_aligned
+                    z_aligned_dict[i+1] = z_i1_aligned
+                    loss_CCA_total += loss_CCA
+            else:
+                # If no Deep CCA, use original representations
+                for i in range(num_datasets):
+                    z_aligned_dict[i] = z_dict[i]
+
             # discriminator loss:
             for _ in range(5):
                 optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
-                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
+                    # Use aligned representations for discriminator
+                    z_i = z_aligned_dict[i]
+                    z_i1 = z_aligned_dict[i+1]
+                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
             # autoencoder loss:
             loss_AE = 0
             for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_dict[i]) - x_dict[i])**2)
+                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_dict[i])**2)
 
             # latent align loss:
             loss_LA = 0
             for i in range(num_datasets-1):
-                loss_LA += torch.mean((z_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_dict[i])))**2)
-                loss_LA += torch.mean((z_dict[i+1] - self.E_dict[i](self.G_dict[i](z_dict[i+1])))**2)
+                loss_LA += torch.mean((z_aligned_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_aligned_dict[i])))**2)
+                loss_LA += torch.mean((z_aligned_dict[i+1] - self.E_dict[i](self.G_dict[i](z_aligned_dict[i+1])))**2)
 
             # generator loss
             loss_G_GAN = 0
             for i in range(num_datasets-1):
-                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
+                z_i = z_aligned_dict[i]
+                z_i1 = z_aligned_dict[i+1]
+                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
 
             # geometric structure loss
             loss_Geo = 0
@@ -646,18 +849,26 @@ class Model(object):
                     batch_labels_1
                 )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
-                z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
+                # Use aligned representations for MNN loss
+                z_dist = torch.mean((z_aligned_dict[i].view(self.batch_size, 1, -1) - z_aligned_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
             optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
+            loss_G = (self.lambdaGAN * loss_G_GAN + 
+                     self.lambdaAE * loss_AE + 
+                     self.lambdaLA * loss_LA + 
+                     self.lambdaMNN * loss_MNN + 
+                     self.lambdaGeo * loss_Geo +
+                     self.lambdaCCA * loss_CCA_total)  # Add CCA loss
+            
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
             if not step % 2000:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
-                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
+                cca_status = " (Deep CCA)" if self.use_deep_cca else ""
+                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -684,5 +895,10 @@ class Model(object):
         for i in range(num_datasets):
             state['E_%d' % i] = self.E_dict[i].state_dict()
             state['G_%d' % i] = self.G_dict[i].state_dict()
+        
+        # Save Deep CCA states if used
+        if self.use_deep_cca:
+            for i in range(num_datasets-1):
+                state['deep_cca_%d' % i] = self.deep_cca_dict[i].state_dict()
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
