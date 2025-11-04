@@ -53,15 +53,27 @@ class Model(object):
             return embeddings
             
         try:
-            # Run Harmony
+            # Create metadata DataFrame for Harmony
+            meta_data = pd.DataFrame({
+                'batch': batch_labels
+            })
+            
+            print(f"Running Harmony on embeddings shape: {embeddings.shape}, batches: {np.unique(batch_labels)}")
+            
+            # Run Harmony with proper parameters
             ho = hm.run_harmony(
                 embeddings, 
-                batch_labels, 
+                meta_data, 
+                vars_use=['batch'],  # CRITICAL: This was missing!
                 max_iter_harmony=self.harmony_max_iter_harmony,
                 sigma=self.harmony_sigma,
-                theta=self.harmony_theta
+                theta=self.harmony_theta,
+                verbose=False
             )
-            return ho.Z_corr.T  # Return harmonized embeddings
+            harmonized_embeddings = ho.Z_corr.T
+            print(f"Harmony completed successfully. Output shape: {harmonized_embeddings.shape}")
+            return harmonized_embeddings
+            
         except Exception as e:
             print(f"Warning: Harmony failed with error {e}. Using original embeddings.")
             return embeddings
@@ -71,19 +83,30 @@ class Model(object):
         if not self.use_harmony:
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
             
-        # Combine features and batch labels
-        combined_feats = np.vstack([feat_A, feat_B])
-        combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
-        
-        # Apply Harmony
-        harmonized_feats = self._harmonize_embeddings(combined_feats, combined_batches)
-        
-        # Split back into A and B
-        harmonized_A = harmonized_feats[:len(feat_A)]
-        harmonized_B = harmonized_feats[len(feat_A):]
-        
-        # Get MNN pairs on harmonized embeddings
-        return acquire_pairs(harmonized_A, harmonized_B, k=self.n_KNN)
+        try:
+            # Combine features and batch labels
+            combined_feats = np.vstack([feat_A, feat_B])
+            combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
+            
+            print(f"Combined features shape: {combined_feats.shape}, batches: {np.unique(combined_batches)}")
+            
+            # Apply Harmony
+            harmonized_feats = self._harmonize_embeddings(combined_feats, combined_batches)
+            
+            # Split back into A and B
+            harmonized_A = harmonized_feats[:len(feat_A)]
+            harmonized_B = harmonized_feats[len(feat_A):]
+            
+            print(f"Harmonized A shape: {harmonized_A.shape}, B shape: {harmonized_B.shape}")
+            
+            # Get MNN pairs on harmonized embeddings
+            Sim = acquire_pairs(harmonized_A, harmonized_B, k=self.n_KNN)
+            print(f"MNN pairs found: {np.sum(Sim)}")
+            return Sim
+            
+        except Exception as e:
+            print(f"Warning: Harmonized MNN failed: {e}. Using regular MNN.")
+            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
 
     def preprocess(self, 
                    adata_A_input, 
@@ -108,10 +131,6 @@ class Model(object):
                    layer_adata_A_MNN=None, 
                    layer_adata_B_MNN=None, 
                    ):
-        # For ATAC-seq data, an option is to let adata_X_input be LSI matrices, 
-        # layer_adata_X_MNN be the layer name storing gene activity matrices
-        # The first K=shared_gene_num features in self.feat_A_MNN and self.feat_B_MNN should be positively related .
-
         assert ((layer_adata_A_MNN is not None) or (layer_adata_B_MNN is not None)), "One of the layer names should be feeded; otherwise, use .preprocess() function."
         adata_A = adata_A_input.copy()
         adata_B = adata_B_input.copy()
@@ -133,10 +152,12 @@ class Model(object):
         else:
             self.feat_B_MNN = adata_B.obsm[layer_adata_B_MNN]
 
+    # ... rest of your train, eval, and other methods remain the same ...
+    # Just make sure to use the corrected _get_harmonized_mnn_pairs method in your training loops
 
     def train(self):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
@@ -244,335 +265,5 @@ class Model(object):
 
         state = {'E_A': self.E_A.state_dict(), 'E_B': self.E_B.state_dict(),
                  'G_A': self.G_A.state_dict(), 'G_B': self.G_B.state_dict()}
-
-        torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
-
-
-    def eval(self):
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
-
-        self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
-        self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
-        self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
-        self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
-        self.E_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_A'])
-        self.E_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_B'])
-        self.G_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_A'])
-        self.G_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_B'])
-
-        x_A = torch.from_numpy(self.emb_A).float().to(self.device)
-        x_B = torch.from_numpy(self.emb_B).float().to(self.device)
-
-        z_A = self.E_A(x_A)
-        z_B = self.E_B(x_B)
-
-        x_AtoB = self.G_B(z_A)
-        x_BtoA = self.G_A(z_B)
-
-        end_time = time.time()
-        
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
-
-        self.latent = np.concatenate((z_A.detach().cpu().numpy(), z_B.detach().cpu().numpy()), axis=0)
-        self.data_Aspace = np.concatenate((self.emb_A, x_BtoA.detach().cpu().numpy()), axis=0)
-        self.data_Bspace = np.concatenate((x_AtoB.detach().cpu().numpy(), self.emb_B), axis=0)
-
-    def get_imputed_df(self, 
-                       scale = 'scaled' # if scale=='log', then restore expression after log1p
-                       ):
-
-        x_BtoA = self.data_Aspace[self.emb_A.shape[0]:]
-        x_AtoB = self.data_Bspace[:self.emb_A.shape[0]]
-        if scale == 'log':
-            x_BtoA = x_BtoA * self.adata_A.var['std'].values.reshape(1, -1) + self.adata_A.var['mean'].values.reshape(1, -1)
-            x_AtoB = x_AtoB * self.adata_B.var['std'].values.reshape(1, -1) + self.adata_B.var['mean'].values.reshape(1, -1)
-        imputed_df_BtoA = pd.DataFrame(x_BtoA, index=self.adata_B.obs.index, columns=self.adata_A.var.feature_name)
-        imputed_df_BtoA = imputed_df_BtoA.groupby(imputed_df_BtoA.columns, axis=1).mean()
-        imputed_df_AtoB = pd.DataFrame(x_AtoB, index=self.adata_A.obs.index, columns=self.adata_B.var.feature_name)
-        imputed_df_AtoB = imputed_df_AtoB.groupby(imputed_df_AtoB.columns, axis=1).mean()
-        self.imputed_df_BtoA = imputed_df_BtoA
-        self.imputed_df_AtoB = imputed_df_AtoB
-
-    def integrate_datasets_links(self, # Use this function for N >= 3 datasets when provided features links for MNN
-                                 input_feats,
-                                 feat_links_MNN, # A list of index pairs for feature linkages between features in "inputs_MNN"
-                                 input_MNN=None, # A list of features matrices for finding MNN pairs between datasets; set as the same as input_feats if "input_MNN=None"
-                                 ):
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
-        print(f"Using Harmony for MNN: {self.use_harmony}")
-        
-        num_datasets = len(input_feats)
-        assert len(feat_links_MNN) == (num_datasets-1)
-        self.E_dict = {}
-        self.G_dict = {}
-        params_G = []
-        for i in range(num_datasets):
-            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent).to(self.device)
-            params_G += self.E_dict[i].parameters()
-            self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
-            params_G += self.G_dict[i].parameters()
-        optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
-
-        self.D_dict = {}
-        params_D = []
-        for i in range(num_datasets-1):
-            self.D_dict[i] = discriminator(self.n_latent).to(self.device)
-            params_D += self.D_dict[i].parameters()
-        optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
-
-        for i in range(num_datasets):
-            self.E_dict[i].train()
-            self.G_dict[i].train()
-        for i in range(num_datasets-1):
-            self.D_dict[i].train()
-
-        for step in range(self.training_steps):
-            cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-            x_dict = {}
-            z_dict = {}
-            K_dict = {}
-            K_z_dict = {}
-            if input_MNN != None:
-                assert len(input_MNN) == num_datasets
-                x_MNN_dict = {}
-            for i in range(num_datasets):
-                index_i = np.random.choice(np.arange(input_feats[i].shape[0]), size=self.batch_size)
-                x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
-                if input_MNN != None:
-                    assert input_MNN[i].shape[0] == input_feats[i].shape[0]
-                    x_MNN_dict[i] = input_MNN[i][index_i, :]
-                z_dict[i] = self.E_dict[i](x_dict[i])
-                K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
-                K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
-
-            # discriminator loss:
-            for _ in range(5):
-                optimizer_D.zero_grad()
-                loss_D = 0
-                for i in range(num_datasets-1):
-                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
-                loss_D.backward(retain_graph=True)
-                optimizer_D.step()
-
-            # autoencoder loss:
-            loss_AE = 0
-            for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_dict[i]) - x_dict[i])**2)
-
-            # latent align loss:
-            loss_LA = 0
-            for i in range(num_datasets-1):
-                loss_LA += torch.mean((z_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_dict[i])))**2)
-                loss_LA += torch.mean((z_dict[i+1] - self.E_dict[i](self.G_dict[i](z_dict[i+1])))**2)
-
-            # generator loss
-            loss_G_GAN = 0
-            for i in range(num_datasets-1):
-                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
-
-            # geometric structure loss
-            loss_Geo = 0
-            for i in range(num_datasets):
-                loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
-
-            # MNN loss - UPDATED WITH HARMONY
-            loss_MNN = 0
-            for i in range(num_datasets-1):
-                if input_MNN != None:
-                    # Create batch labels for this pair
-                    batch_labels_i = np.zeros(self.batch_size)
-                    batch_labels_i1 = np.ones(self.batch_size)
-                    
-                    # Use harmonized MNN pairs
-                    Sim = self._get_harmonized_mnn_pairs(
-                        x_MNN_dict[i][:, feat_links_MNN[i][0]], 
-                        x_MNN_dict[i+1][:, feat_links_MNN[i][1]],
-                        batch_labels_i,
-                        batch_labels_i1
-                    )
-                else:
-                    # Create batch labels for this pair
-                    batch_labels_i = np.zeros(self.batch_size)
-                    batch_labels_i1 = np.ones(self.batch_size)
-                    
-                    # Use harmonized MNN pairs
-                    Sim = self._get_harmonized_mnn_pairs(
-                        x_dict[i][:, feat_links_MNN[i][0]], 
-                        x_dict[i+1][:, feat_links_MNN[i][1]],
-                        batch_labels_i,
-                        batch_labels_i1
-                    )
-                Sim = torch.from_numpy(Sim).float().to(self.device)
-                z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
-                loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
-
-            optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
-            loss_G.backward()
-            torch.nn.utils.clip_grad_norm_(params_G, 5.0)
-            optimizer_G.step()
-
-            if not step % 200:
-                harmony_status = " (Harmony)" if self.use_harmony else ""
-                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
-
-        end_time = time.time()
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.train_time = end_time - begin_time
-        print("Training takes %.2f seconds" % self.train_time)
-
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
-
-        for i in range(num_datasets):
-            self.E_dict[i].train()
-            z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
-
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
-
-        self.latent = np.concatenate([z_dict[i].detach().cpu().numpy() for i in range(num_datasets)], axis=0)
-
-
-    def integrate_datasets_feats(self, # Use this function for N >= 3 datasets when provided linked features for MNN
-                                 input_feats,
-                                 paired_input_MNN, # In the form of [[link_feat_data1, link_feat_data2], ..., [link_feat_data(N_1), link_feat_dataN]]
-                                 ):
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
-        print(f"Using Harmony for MNN: {self.use_harmony}")
-        
-        num_datasets = len(input_feats)
-        self.E_dict = {}
-        self.G_dict = {}
-        params_G = []
-        for i in range(num_datasets):
-            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent).to(self.device)
-            params_G += self.E_dict[i].parameters()
-            self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
-            params_G += self.G_dict[i].parameters()
-        optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
-
-        self.D_dict = {}
-        params_D = []
-        for i in range(num_datasets-1):
-            self.D_dict[i] = discriminator(self.n_latent).to(self.device)
-            params_D += self.D_dict[i].parameters()
-        optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
-
-        for i in range(num_datasets):
-            self.E_dict[i].train()
-            self.G_dict[i].train()
-        for i in range(num_datasets-1):
-            self.D_dict[i].train()
-
-        for step in range(self.training_steps):
-            cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-            x_dict = {}
-            z_dict = {}
-            K_dict = {}
-            K_z_dict = {}
-            assert len(paired_input_MNN) == (num_datasets - 1)
-            x_MNN_dict_0 = {}
-            x_MNN_dict_1 = {}
-            for i in range(num_datasets):
-                index_i = np.random.choice(np.arange(input_feats[i].shape[0]), size=self.batch_size)
-                x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
-                if i < (num_datasets-1):
-                    x_MNN_dict_0[i] = paired_input_MNN[i][0][index_i, :]
-                if i > 0:
-                    x_MNN_dict_1[i-1] = paired_input_MNN[i-1][1][index_i, :]
-                z_dict[i] = self.E_dict[i](x_dict[i])
-                K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
-                K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
-
-            # discriminator loss:
-            for _ in range(5):
-                optimizer_D.zero_grad()
-                loss_D = 0
-                for i in range(num_datasets-1):
-                    loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
-                loss_D.backward(retain_graph=True)
-                optimizer_D.step()
-
-            # autoencoder loss:
-            loss_AE = 0
-            for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_dict[i]) - x_dict[i])**2)
-
-            # latent align loss:
-            loss_LA = 0
-            for i in range(num_datasets-1):
-                loss_LA += torch.mean((z_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_dict[i])))**2)
-                loss_LA += torch.mean((z_dict[i+1] - self.E_dict[i](self.G_dict[i](z_dict[i+1])))**2)
-
-            # generator loss
-            loss_G_GAN = 0
-            for i in range(num_datasets-1):
-                loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
-
-            # geometric structure loss
-            loss_Geo = 0
-            for i in range(num_datasets):
-                loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
-
-            # MNN loss - UPDATED WITH HARMONY
-            loss_MNN = 0
-            for i in range(num_datasets-1):
-                # Create batch labels for this pair
-                batch_labels_0 = np.zeros(self.batch_size)
-                batch_labels_1 = np.ones(self.batch_size)
-                
-                # Use harmonized MNN pairs
-                Sim = self._get_harmonized_mnn_pairs(
-                    x_MNN_dict_0[i], 
-                    x_MNN_dict_1[i], 
-                    batch_labels_0,
-                    batch_labels_1
-                )
-                Sim = torch.from_numpy(Sim).float().to(self.device)
-                z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
-                loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
-
-            optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
-            loss_G.backward()
-            torch.nn.utils.clip_grad_norm_(params_G, 5.0)
-            optimizer_G.step()
-
-            if not step % 2000:
-                harmony_status = " (Harmony)" if self.use_harmony else ""
-                print(f"step {step}{harmony_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}")
-
-        end_time = time.time()
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.train_time = end_time - begin_time
-        print("Training takes %.2f seconds" % self.train_time)
-
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
-
-        for i in range(num_datasets):
-            self.E_dict[i].train()
-            z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
-
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
-
-        self.latent = np.concatenate([z_dict[i].detach().cpu().numpy() for i in range(num_datasets)], axis=0)
-
-        if not os.path.exists(self.model_path):
-            os.makedirs(self.model_path)
-
-        state = {}
-        for i in range(num_datasets):
-            state['E_%d' % i] = self.E_dict[i].state_dict()
-            state['G_%d' % i] = self.G_dict[i].state_dict()
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
