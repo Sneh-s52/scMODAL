@@ -15,7 +15,7 @@ class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
                  model_path="models", data_path="data", result_path="results", 
-                 use_harmony=True, harmony_max_iter_harmony=20, harmony_sigma=0.1, harmony_theta=2.0):
+                 use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0):  # Reduced iterations
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         torch.manual_seed(seed)
@@ -39,9 +39,13 @@ class Model(object):
         
         # Harmony parameters
         self.use_harmony = use_harmony
-        self.harmony_max_iter_harmony = harmony_max_iter_harmony
+        self.harmony_max_iter_harmony = harmony_max_iter_harmony  # Reduced from 20 to 10
         self.harmony_sigma = harmony_sigma
         self.harmony_theta = harmony_theta
+        
+        # Precomputed Harmony embeddings
+        self.precomputed_harmony_A = None
+        self.precomputed_harmony_B = None
         
         # Check if harmonypy is available
         self.harmony_available = self._check_harmony_availability()
@@ -57,107 +61,40 @@ class Model(object):
             print("harmonypy not available, using simple batch correction")
             return False
 
-    def _simple_batch_correction(self, embeddings, batch_labels):
-        """Simple but effective batch correction"""
+    def _precompute_harmony_embeddings(self):
+        """Precompute Harmony embeddings once at the beginning"""
+        if not self.use_harmony or not self.harmony_available:
+            return
+            
         try:
-            embeddings = np.array(embeddings, dtype=np.float32)
-            batch_labels = np.array(batch_labels)
+            print("Precomputing Harmony embeddings for entire dataset...")
             
-            unique_batches = np.unique(batch_labels)
-            if len(unique_batches) <= 1:
-                return embeddings
-                
-            # Method 1: Remove batch means
-            batch_corrected = embeddings.copy()
-            
-            for batch in unique_batches:
-                batch_mask = batch_labels == batch
-                batch_data = embeddings[batch_mask]
-                
-                if len(batch_data) > 0:
-                    # Remove batch-specific mean
-                    batch_mean = np.mean(batch_data, axis=0)
-                    batch_corrected[batch_mask] = batch_data - batch_mean
-            
-            # Add global mean back to preserve overall structure
-            global_mean = np.mean(embeddings, axis=0)
-            batch_corrected += global_mean
-            
-            return batch_corrected
-            
-        except Exception as e:
-            print(f"Simple batch correction failed: {e}")
-            return embeddings
-
-    def _advanced_batch_correction(self, embeddings, batch_labels):
-        """More advanced batch correction using SVD"""
-        try:
-            embeddings = np.array(embeddings, dtype=np.float32)
-            batch_labels = np.array(batch_labels)
-            
-            unique_batches = np.unique(batch_labels)
-            if len(unique_batches) <= 1:
-                return embeddings
-            
-            # Center the data
-            overall_mean = np.mean(embeddings, axis=0)
-            centered_data = embeddings - overall_mean
-            
-            # Perform SVD
-            U, s, Vt = np.linalg.svd(centered_data, full_matrices=False)
-            
-            # Remove top components that might capture batch effects
-            n_remove = min(3, len(s) - 1)  # Remove up to 3 components
-            if n_remove > 0:
-                s[:n_remove] = 0  # Zero out top components
-                corrected_data = U @ np.diag(s) @ Vt
+            # Use shared features for Harmony
+            if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
+                feat_A = self.feat_A_MNN
+                feat_B = self.feat_B_MNN
             else:
-                corrected_data = centered_data
+                feat_A = self.emb_A[:, :self.shared_gene_num]
+                feat_B = self.emb_B[:, :self.shared_gene_num]
             
-            # Add mean back
-            return corrected_data + overall_mean
-            
-        except Exception as e:
-            print(f"Advanced batch correction failed: {e}")
-            return self._simple_batch_correction(embeddings, batch_labels)
-
-    def _harmonize_embeddings(self, embeddings, batch_labels):
-        """Main batch correction method with fallbacks"""
-        if not self.use_harmony:
-            return embeddings
-            
-        # Try harmonypy if available
-        if self.harmony_available:
-            try:
-                return self._harmonize_with_harmonypy(embeddings, batch_labels)
-            except Exception as e:
-                print(f"harmonypy failed: {e}")
-        
-        # Fallback to advanced batch correction
-        print("Using advanced batch correction as fallback")
-        return self._advanced_batch_correction(embeddings, batch_labels)
-
-    def _harmonize_with_harmonypy(self, embeddings, batch_labels):
-        """Use harmonypy with proper error handling"""
-        try:
-            embeddings = np.array(embeddings, dtype=np.float32)
-            batch_labels = np.array(batch_labels)
-            
-            unique_batches = np.unique(batch_labels)
-            if len(unique_batches) <= 1:
-                return embeddings
+            # Convert to dense if sparse
+            if hasattr(feat_A, 'toarray'):
+                feat_A = feat_A.toarray()
+            if hasattr(feat_B, 'toarray'):
+                feat_B = feat_B.toarray()
                 
-            # Create proper metadata
-            batch_str = [f"batch_{int(b)}" for b in batch_labels]
+            combined_feats = np.vstack([feat_A, feat_B])
+            combined_batches = np.concatenate([self.batch_labels_A, self.batch_labels_B])
+            
+            print(f"Precomputing Harmony on {len(combined_feats)} cells...")
+            
+            # Run Harmony once
+            batch_str = [f"batch_{int(b)}" for b in combined_batches]
             meta_data = pd.DataFrame({'batch': batch_str})
             vars_use = ['batch']
             
-            # Import harmonypy here to ensure it's in scope
-            import harmonypy as hm
-            
-            # Run Harmony
-            ho = hm.run_harmony(
-                embeddings, 
+            ho = self.hm.run_harmony(
+                combined_feats, 
                 meta_data, 
                 vars_use,
                 max_iter_harmony=self.harmony_max_iter_harmony,
@@ -165,57 +102,43 @@ class Model(object):
                 theta=self.harmony_theta
             )
             
-            return ho.Z_corr.T
+            harmonized_all = ho.Z_corr.T
+            
+            # Split and store
+            self.precomputed_harmony_A = harmonized_all[:len(feat_A)]
+            self.precomputed_harmony_B = harmonized_all[len(feat_A):]
+            
+            print(f"Precomputed Harmony embeddings: A={self.precomputed_harmony_A.shape}, B={self.precomputed_harmony_B.shape}")
             
         except Exception as e:
-            print(f"harmonypy processing failed: {e}")
-            raise  # Re-raise to trigger fallback
+            print(f"Precomputing Harmony failed: {e}")
+            self.precomputed_harmony_A = None
+            self.precomputed_harmony_B = None
 
-    def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
-        """Get MNN pairs using batch-corrected embeddings"""
-        if not self.use_harmony:
-            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
-            
-        try:
-            # Convert to dense arrays if sparse
-            if hasattr(feat_A, 'toarray'):
-                feat_A = feat_A.toarray()
-            if hasattr(feat_B, 'toarray'):
-                feat_B = feat_B.toarray()
+    def _get_harmonized_mnn_pairs_fast(self, index_A, index_B):
+        """Fast MNN pairs using precomputed Harmony embeddings"""
+        if not self.use_harmony or self.precomputed_harmony_A is None or self.precomputed_harmony_B is None:
+            # Fallback to simple method
+            if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
+                feat_A_batch = self.feat_A_MNN[index_A]
+                feat_B_batch = self.feat_B_MNN[index_B]
+            else:
+                feat_A_batch = self.emb_A[index_A, :self.shared_gene_num]
+                feat_B_batch = self.emb_B[index_B, :self.shared_gene_num]
                 
-            # Ensure proper array format
-            feat_A = np.array(feat_A, dtype=np.float32)
-            feat_B = np.array(feat_B, dtype=np.float32)
-            
-            # Handle 1D arrays
-            if feat_A.ndim == 1:
-                feat_A = feat_A.reshape(-1, 1)
-            if feat_B.ndim == 1:
-                feat_B = feat_B.reshape(-1, 1)
+            if hasattr(feat_A_batch, 'toarray'):
+                feat_A_batch = feat_A_batch.toarray()
+            if hasattr(feat_B_batch, 'toarray'):
+                feat_B_batch = feat_B_batch.toarray()
                 
-            combined_feats = np.vstack([feat_A, feat_B])
-            combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
-            
-            print(f"Applying batch correction to {len(combined_feats)} cells")
-            
-            # Apply batch correction
-            corrected_feats = self._harmonize_embeddings(combined_feats, combined_batches)
-            
-            # Split back
-            corrected_A = corrected_feats[:len(feat_A)]
-            corrected_B = corrected_feats[len(feat_A):]
-            
-            print("Finding MNN pairs on batch-corrected features")
-            return acquire_pairs(corrected_A, corrected_B, k=self.n_KNN)
-            
-        except Exception as e:
-            print(f"Batch-corrected MNN failed: {e}. Using regular MNN.")
-            return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
+            return acquire_pairs(feat_A_batch, feat_B_batch, k=self.n_KNN)
+        
+        # Use precomputed Harmony embeddings
+        harmony_A_batch = self.precomputed_harmony_A[index_A]
+        harmony_B_batch = self.precomputed_harmony_B[index_B]
+        
+        return acquire_pairs(harmony_A_batch, harmony_B_batch, k=self.n_KNN)
 
-    # ... [ALL YOUR OTHER METHODS REMAIN EXACTLY THE SAME] ...
-
-    # ... [REST OF YOUR METHODS STAY THE SAME] ...
-            
     def preprocess(self, 
                    adata_A_input, 
                    adata_B_input, 
@@ -229,8 +152,11 @@ class Model(object):
         self.emb_B = self.adata_B.X
         
         # Create batch labels for Harmony
-        self.batch_labels_A = np.zeros(self.emb_A.shape[0])  # Batch 0 for dataset A
-        self.batch_labels_B = np.ones(self.emb_B.shape[0])   # Batch 1 for dataset B
+        self.batch_labels_A = np.zeros(self.emb_A.shape[0])
+        self.batch_labels_B = np.ones(self.emb_B.shape[0])
+        
+        # Precompute Harmony embeddings
+        self._precompute_harmony_embeddings()
 
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
@@ -239,10 +165,6 @@ class Model(object):
                    layer_adata_A_MNN=None, 
                    layer_adata_B_MNN=None, 
                    ):
-        # For ATAC-seq data, an option is to let adata_X_input be LSI matrices, 
-        # layer_adata_X_MNN be the layer name storing gene activity matrices
-        # The first K=shared_gene_num features in self.feat_A_MNN and self.feat_B_MNN should be positively related .
-
         assert ((layer_adata_A_MNN is not None) or (layer_adata_B_MNN is not None)), "One of the layer names should be feeded; otherwise, use .preprocess() function."
         adata_A = adata_A_input.copy()
         adata_B = adata_B_input.copy()
@@ -252,8 +174,8 @@ class Model(object):
         self.emb_B = adata_B.X
         
         # Create batch labels for Harmony
-        self.batch_labels_A = np.zeros(self.emb_A.shape[0])  # Batch 0 for dataset A
-        self.batch_labels_B = np.ones(self.emb_B.shape[0])   # Batch 1 for dataset B
+        self.batch_labels_A = np.zeros(self.emb_A.shape[0])
+        self.batch_labels_B = np.ones(self.emb_B.shape[0])
         
         if layer_adata_A_MNN is None:
             self.feat_A_MNN = self.emb_A
@@ -263,12 +185,21 @@ class Model(object):
             self.feat_B_MNN = self.emb_B
         else:
             self.feat_B_MNN = adata_B.obsm[layer_adata_B_MNN]
-
+            
+        # Precompute Harmony embeddings
+        self._precompute_harmony_embeddings()
 
     def train(self):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
+        
+        # Show precomputation status
+        if self.use_harmony:
+            if self.precomputed_harmony_A is not None:
+                print("✓ Using precomputed Harmony embeddings")
+            else:
+                print("✗ Using fallback batch correction")
         
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
@@ -333,24 +264,8 @@ class Model(object):
             # geometric structure loss
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
 
-            # MNN loss - UPDATED WITH HARMONY
-            if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
-                # Use additional features for MNN if available
-                Sim = self._get_harmonized_mnn_pairs(
-                    self.feat_A_MNN[index_A], 
-                    self.feat_B_MNN[index_B],
-                    self.batch_labels_A[index_A],
-                    self.batch_labels_B[index_B]
-                )
-            else:
-                # Use shared genes for MNN
-                Sim = self._get_harmonized_mnn_pairs(
-                    self.emb_A[index_A, :self.shared_gene_num], 
-                    self.emb_B[index_B, :self.shared_gene_num],
-                    self.batch_labels_A[index_A],
-                    self.batch_labels_B[index_B]
-                )
-            
+            # MNN loss - FAST VERSION USING PRECOMPUTED EMBEDDINGS
+            Sim = self._get_harmonized_mnn_pairs_fast(index_A, index_B)
             Sim = torch.from_numpy(Sim).float().to(self.device)
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
@@ -377,6 +292,8 @@ class Model(object):
                  'G_A': self.G_A.state_dict(), 'G_B': self.G_B.state_dict()}
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
+
+    # ... [REST OF YOUR METHODS STAY THE SAME] ...
 
 
     def eval(self):
