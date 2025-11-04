@@ -53,27 +53,25 @@ class Model(object):
             return embeddings
             
         try:
-            # Create metadata DataFrame for Harmony
+            # Create proper metadata DataFrame for Harmony
             meta_data = pd.DataFrame({
                 'batch': batch_labels
             })
             
-            # Run Harmony with proper parameters - FIXED: added vars_use parameter
+            # Run Harmony with proper parameters
             ho = hm.run_harmony(
                 embeddings, 
                 meta_data, 
-                vars_use=['batch'],  # CRITICAL FIX: This parameter was missing
+                vars_use=['batch'],  # CRITICAL FIX
                 max_iter_harmony=self.harmony_max_iter_harmony,
                 sigma=self.harmony_sigma,
-                theta=self.harmony_theta,
-                verbose=False
+                theta=self.harmony_theta
             )
             return ho.Z_corr.T  # Return harmonized embeddings
-            
         except Exception as e:
             print(f"Warning: Harmony failed with error {e}. Using original embeddings.")
             return embeddings
-
+    
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
         """Get MNN pairs using harmonized embeddings"""
         if not self.use_harmony:
@@ -149,7 +147,7 @@ class Model(object):
 
     def train(self):
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
@@ -263,7 +261,7 @@ class Model(object):
 
     def eval(self):
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
 
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
@@ -315,7 +313,7 @@ class Model(object):
                                  input_MNN=None, # A list of features matrices for finding MNN pairs between datasets; set as the same as input_feats if "input_MNN=None"
                                  ):
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         num_datasets = len(input_feats)
@@ -439,7 +437,7 @@ class Model(object):
         print("Training takes %.2f seconds" % self.train_time)
 
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
 
         for i in range(num_datasets):
             self.E_dict[i].train()
@@ -457,7 +455,7 @@ class Model(object):
                                  paired_input_MNN, # In the form of [[link_feat_data1, link_feat_data2], ..., [link_feat_data(N_1), link_feat_dataN]]
                                  ):
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         
         num_datasets = len(input_feats)
@@ -568,7 +566,7 @@ class Model(object):
         print("Training takes %.2f seconds" % self.train_time)
 
         begin_time = time.time()
-        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)))
 
         for i in range(num_datasets):
             self.E_dict[i].train()
