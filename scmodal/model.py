@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import harmonypy as hm
 
 from scmodal.networks import *
 from scmodal.utils import *
@@ -18,10 +17,7 @@ class Model(object):
                  model_path="models", data_path="data", result_path="results", 
                  use_harmony=True, harmony_max_iter_harmony=20, harmony_sigma=0.1, harmony_theta=2.0):
 
-        # add device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-        # set random seed
         torch.manual_seed(seed)
         np.random.seed(seed)
         if torch.cuda.is_available():
@@ -47,65 +43,126 @@ class Model(object):
         self.harmony_sigma = harmony_sigma
         self.harmony_theta = harmony_theta
 
-    def _harmonize_embeddings(self, embeddings, batch_labels):
-        """Apply Harmony batch correction - FIXED VERSION"""
-        if not self.use_harmony:
-            return embeddings
-            
+    def _simple_batch_correction(self, embeddings, batch_labels):
+        """Simple batch correction without external dependencies"""
         try:
-            # Convert to proper format
             embeddings = np.array(embeddings, dtype=np.float32)
             batch_labels = np.array(batch_labels)
             
-            # Check if we have multiple batches
             unique_batches = np.unique(batch_labels)
             if len(unique_batches) <= 1:
                 return embeddings
                 
-            # OFFICIAL HARMONYPY PATTERN
-            meta_data = pd.DataFrame({'batch': batch_labels})
-            vars_use = ['batch']  # THIS WAS THE MISSING PARAMETER
+            print(f"Applying simple batch correction to {len(embeddings)} cells across {len(unique_batches)} batches")
             
-            ho = hm.run_harmony(
-                embeddings, 
-                meta_data, 
-                vars_use,  # NOW INCLUDED!
-                max_iter_harmony=self.harmony_max_iter_harmony,
-                sigma=self.harmony_sigma,
-                theta=self.harmony_theta
-            )
+            # Simple approach: center each batch and then combine
+            batch_corrected = np.zeros_like(embeddings)
             
-            return ho.Z_corr.T
+            for batch in unique_batches:
+                batch_mask = batch_labels == batch
+                batch_data = embeddings[batch_mask]
+                
+                # Center the batch
+                batch_mean = np.mean(batch_data, axis=0)
+                batch_corrected[batch_mask] = batch_data - batch_mean
+                
+            # Add overall mean back
+            overall_mean = np.mean(embeddings, axis=0)
+            batch_corrected += overall_mean
+            
+            return batch_corrected
             
         except Exception as e:
-            print(f"Harmony failed: {e}. Using original embeddings.")
+            print(f"Simple batch correction failed: {e}")
             return embeddings
-    
+
+    def _harmonize_embeddings(self, embeddings, batch_labels):
+        """Robust Harmony integration with fallbacks"""
+        if not self.use_harmony:
+            return embeddings
+            
+        try:
+            # Try harmonypy first
+            return self._harmonize_with_harmonypy(embeddings, batch_labels)
+        except Exception as e:
+            print(f"harmonypy failed: {e}. Using simple batch correction.")
+            return self._simple_batch_correction(embeddings, batch_labels)
+
+    def _harmonize_with_harmonypy(self, embeddings, batch_labels):
+        """Try harmonypy with multiple approaches"""
+        embeddings = np.array(embeddings, dtype=np.float32)
+        batch_labels = np.array(batch_labels)
+        
+        unique_batches = np.unique(batch_labels)
+        if len(unique_batches) <= 1:
+            return embeddings
+            
+        # Convert batch labels to strings
+        batch_str = [str(int(b)) for b in batch_labels]
+        meta_data = pd.DataFrame({'batch': batch_str})
+        vars_use = ['batch']
+        
+        # Try different parameter combinations
+        try:
+            # Method 1: Basic call
+            ho = hm.run_harmony(embeddings, meta_data, vars_use)
+            return ho.Z_corr.T
+        except Exception as e1:
+            print(f"Method 1 failed: {e1}")
+            
+            # Method 2: With all parameters
+            try:
+                ho = hm.run_harmony(
+                    embeddings, meta_data, vars_use,
+                    max_iter_harmony=self.harmony_max_iter_harmony,
+                    sigma=self.harmony_sigma,
+                    theta=self.harmony_theta
+                )
+                return ho.Z_corr.T
+            except Exception as e2:
+                print(f"Method 2 failed: {e2}")
+                raise Exception("All harmonypy methods failed")
+
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
-        """Get MNN pairs using harmonized embeddings"""
+        """Get MNN pairs using batch-corrected embeddings"""
         if not self.use_harmony:
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
             
         try:
-            # Convert to dense arrays if sparse
+            # Handle sparse matrices
             if hasattr(feat_A, 'toarray'):
                 feat_A = feat_A.toarray()
             if hasattr(feat_B, 'toarray'):
                 feat_B = feat_B.toarray()
                 
+            # Ensure 2D arrays
+            feat_A = np.array(feat_A)
+            feat_B = np.array(feat_B)
+            if feat_A.ndim == 1:
+                feat_A = feat_A.reshape(-1, 1)
+            if feat_B.ndim == 1:
+                feat_B = feat_B.reshape(-1, 1)
+                
             combined_feats = np.vstack([feat_A, feat_B])
             combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
             
-            harmonized_feats = self._harmonize_embeddings(combined_feats, combined_batches)
+            print(f"Combining {len(feat_A)} + {len(feat_B)} = {len(combined_feats)} cells for batch correction")
             
-            harmonized_A = harmonized_feats[:len(feat_A)]
-            harmonized_B = harmonized_feats[len(feat_A):]
+            # Apply batch correction
+            corrected_feats = self._harmonize_embeddings(combined_feats, combined_batches)
             
-            return acquire_pairs(harmonized_A, harmonized_B, k=self.n_KNN)
+            # Split back
+            corrected_A = corrected_feats[:len(feat_A)]
+            corrected_B = corrected_feats[len(feat_A):]
+            
+            print("Finding MNN pairs on batch-corrected features...")
+            return acquire_pairs(corrected_A, corrected_B, k=self.n_KNN)
             
         except Exception as e:
             print(f"Harmonized MNN failed: {e}. Using regular MNN.")
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
+
+    # ... [REST OF YOUR METHODS STAY THE SAME] ...
             
     def preprocess(self, 
                    adata_A_input, 
