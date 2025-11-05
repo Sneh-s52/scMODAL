@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import scipy.sparse as sp
+from sklearn.neighbors import NearestNeighbors
 
 from scmodal.networks import *
 from scmodal.utils import *
@@ -16,7 +18,8 @@ class Model(object):
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
                  model_path="models", data_path="data", result_path="results", 
                  use_harmony=True, harmony_max_iter_harmony=10, harmony_sigma=0.1, harmony_theta=2.0,
-                 use_deep_cca=True, lambdaCCA=1.0, cca_dim=16, cca_hidden_dims=[64, 32], cca_mixing_ratio=0.3):
+                 use_deep_cca=True, lambdaCCA=1.0, cca_dim=16, cca_hidden_dims=[64, 32], cca_mixing_ratio=0.3,
+                 use_gat=False, gat_hidden=256, gat_heads=1, gat_dropout=0.1, gat_knn=10):
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         torch.manual_seed(seed)
@@ -49,7 +52,14 @@ class Model(object):
         self.lambdaCCA = lambdaCCA
         self.cca_dim = cca_dim
         self.cca_hidden_dims = cca_hidden_dims
-        self.cca_mixing_ratio = cca_mixing_ratio  # How much to mix CCA-aligned representations
+        self.cca_mixing_ratio = cca_mixing_ratio
+        
+        # GAT parameters
+        self.use_gat = use_gat
+        self.gat_hidden = gat_hidden
+        self.gat_heads = gat_heads
+        self.gat_dropout = gat_dropout
+        self.gat_knn = gat_knn
         
         # Precomputed Harmony embeddings
         self.precomputed_harmony_A = None
@@ -154,6 +164,50 @@ class Model(object):
             print(f"Precomputing Harmony failed: {e}")
             self.precomputed_harmony_A = None
             self.precomputed_harmony_B = None
+
+    def _build_knn_adjacency(self, features, k=10):
+        """Build k-NN adjacency matrix for GAT"""
+        try:
+            n_samples = features.shape[0]
+            
+            # Compute k-nearest neighbors
+            knn = NearestNeighbors(n_neighbors=k, metric='cosine')
+            knn.fit(features)
+            distances, indices = knn.kneighbors(features)
+            
+            # Create adjacency matrix
+            adj = np.zeros((n_samples, n_samples))
+            for i in range(n_samples):
+                adj[i, indices[i]] = 1
+                adj[indices[i], i] = 1  # Symmetric
+            
+            # Normalize adjacency matrix
+            rowsum = np.array(adj.sum(1))
+            degree_mat_inv_sqrt = np.diag(np.power(rowsum, -0.5).flatten())
+            adj_normalized = degree_mat_inv_sqrt.dot(adj).dot(degree_mat_inv_sqrt)
+            
+            return torch.FloatTensor(adj_normalized).to(self.device)
+            
+        except Exception as e:
+            print(f"KNN adjacency failed: {e}")
+            # Return identity matrix as fallback
+            return torch.eye(features.shape[0]).to(self.device)
+
+    def _get_gat_adjacency_batch(self, features_batch, k=10):
+        """Build adjacency matrix for a batch of features"""
+        try:
+            if features_batch.shape[0] <= k:
+                # If batch is smaller than k, use fully connected
+                adj = torch.ones(features_batch.shape[0], features_batch.shape[0])
+            else:
+                # Convert to numpy for kNN
+                features_np = features_batch.detach().cpu().numpy()
+                adj = self._build_knn_adjacency(features_np, k)
+            
+            return adj.to(self.device)
+        except Exception as e:
+            print(f"Batch adjacency failed: {e}")
+            return torch.eye(features_batch.shape[0]).to(self.device)
 
     def _get_harmonized_mnn_pairs_fast(self, index_A, index_B):
         """Fast MNN pairs using precomputed Harmony embeddings"""
@@ -296,6 +350,7 @@ class Model(object):
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
+        print(f"Using GAT: {self.use_gat}")
         
         # Show precomputation status
         if self.use_harmony:
@@ -304,8 +359,18 @@ class Model(object):
             else:
                 print("✗ Using fallback batch correction")
         
-        self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
-        self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
+        # Initialize encoders with GAT parameter
+        self.E_A = encoder(self.emb_A.shape[1], self.n_latent, 
+                          use_gat=self.use_gat, 
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
+        self.E_B = encoder(self.emb_B.shape[1], self.n_latent,
+                          use_gat=self.use_gat,
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
+        
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.D_Z = discriminator(self.n_latent).to(self.device)
@@ -341,9 +406,15 @@ class Model(object):
             x_A = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
             x_B = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
             
-            # Get original latent representations
-            z_A = self.E_A(x_A)
-            z_B = self.E_B(x_B)
+            # Get original latent representations with GAT if enabled
+            if self.use_gat:
+                adj_A = self._get_gat_adjacency_batch(x_A, k=self.gat_knn)
+                adj_B = self._get_gat_adjacency_batch(x_B, k=self.gat_knn)
+                z_A = self.E_A(x_A, adj_A)
+                z_B = self.E_B(x_B, adj_B)
+            else:
+                z_A = self.E_A(x_A)
+                z_B = self.E_B(x_B)
             
             # Apply Deep CCA alignment BEFORE GAN mixing
             z_A_aligned, z_B_aligned, loss_CCA = self._apply_deep_cca_alignment(z_A, z_B)
@@ -413,7 +484,8 @@ class Model(object):
             if not step % 2000:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
                 cca_status = " (Deep CCA)" if self.use_deep_cca else ""
-                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA:.6f}")
+                gat_status = " (GAT)" if self.use_gat else ""
+                print(f"step {step}{harmony_status}{cca_status}{gat_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -436,8 +508,16 @@ class Model(object):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
 
-        self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
-        self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
+        self.E_A = encoder(self.emb_A.shape[1], self.n_latent, 
+                          use_gat=self.use_gat, 
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
+        self.E_B = encoder(self.emb_B.shape[1], self.n_latent,
+                          use_gat=self.use_gat,
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         
@@ -460,6 +540,7 @@ class Model(object):
         x_A = torch.from_numpy(self.emb_A).float().to(self.device)
         x_B = torch.from_numpy(self.emb_B).float().to(self.device)
 
+        # For evaluation, we don't use adjacency matrices (full batch inference)
         z_A = self.E_A(x_A)
         z_B = self.E_B(x_B)
         
@@ -507,6 +588,7 @@ class Model(object):
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
+        print(f"Using GAT: {self.use_gat}")
         
         num_datasets = len(input_feats)
         assert len(feat_links_MNN) == (num_datasets-1)
@@ -514,7 +596,11 @@ class Model(object):
         self.G_dict = {}
         params_G = []
         for i in range(num_datasets):
-            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent).to(self.device)
+            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent,
+                                    use_gat=self.use_gat,
+                                    gat_hidden=self.gat_hidden,
+                                    gat_heads=self.gat_heads,
+                                    dropout=self.gat_dropout).to(self.device)
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
@@ -564,7 +650,14 @@ class Model(object):
                 if input_MNN != None:
                     assert input_MNN[i].shape[0] == input_feats[i].shape[0]
                     x_MNN_dict[i] = input_MNN[i][index_i, :]
-                z_dict[i] = self.E_dict[i](x_dict[i])
+                
+                # Apply GAT if enabled
+                if self.use_gat:
+                    adj_i = self._get_gat_adjacency_batch(x_dict[i], k=self.gat_knn)
+                    z_dict[i] = self.E_dict[i](x_dict[i], adj_i)
+                else:
+                    z_dict[i] = self.E_dict[i](x_dict[i])
+                    
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
 
@@ -667,7 +760,8 @@ class Model(object):
             if not step % 200:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
                 cca_status = " (Deep CCA)" if self.use_deep_cca else ""
-                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
+                gat_status = " (GAT)" if self.use_gat else ""
+                print(f"step {step}{harmony_status}{cca_status}{gat_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -721,13 +815,18 @@ class Model(object):
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
         print(f"Using Harmony for MNN: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
+        print(f"Using GAT: {self.use_gat}")
         
         num_datasets = len(input_feats)
         self.E_dict = {}
         self.G_dict = {}
         params_G = []
         for i in range(num_datasets):
-            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent).to(self.device)
+            self.E_dict[i] = encoder(input_feats[i].shape[1], self.n_latent,
+                                    use_gat=self.use_gat,
+                                    gat_hidden=self.gat_hidden,
+                                    gat_heads=self.gat_heads,
+                                    dropout=self.gat_dropout).to(self.device)
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
@@ -778,7 +877,14 @@ class Model(object):
                     x_MNN_dict_0[i] = paired_input_MNN[i][0][index_i, :]
                 if i > 0:
                     x_MNN_dict_1[i-1] = paired_input_MNN[i-1][1][index_i, :]
-                z_dict[i] = self.E_dict[i](x_dict[i])
+                
+                # Apply GAT if enabled
+                if self.use_gat:
+                    adj_i = self._get_gat_adjacency_batch(x_dict[i], k=self.gat_knn)
+                    z_dict[i] = self.E_dict[i](x_dict[i], adj_i)
+                else:
+                    z_dict[i] = self.E_dict[i](x_dict[i])
+                    
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
 
@@ -868,7 +974,8 @@ class Model(object):
             if not step % 2000:
                 harmony_status = " (Harmony)" if self.use_harmony else ""
                 cca_status = " (Deep CCA)" if self.use_deep_cca else ""
-                print(f"step {step}{harmony_status}{cca_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
+                gat_status = " (GAT)" if self.use_gat else ""
+                print(f"step {step}{harmony_status}{cca_status}{gat_status}, loss_D={loss_D:.6f}, loss_GAN={loss_G_GAN:.6f}, loss_AE={self.lambdaAE*loss_AE:.6f}, loss_Geo={self.lambdaGeo*loss_Geo:.6f}, loss_LA={self.lambdaLA*loss_LA:.6f}, loss_MNN={self.lambdaMNN*loss_MNN:.6f}, loss_CCA={self.lambdaCCA*loss_CCA_total:.6f}")
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
