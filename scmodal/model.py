@@ -49,13 +49,13 @@ class Model(object):
         self.lambdaCCA = lambdaCCA
         self.cca_dim = cca_dim
         self.cca_hidden_dims = cca_hidden_dims
-        self.cca_mixing_ratio = cca_mixing_ratio  # How much to mix CCA-aligned representations
+        self.cca_mixing_ratio = cca_mixing_ratio
         
-        # Precomputed Harmony embeddings
-        self.precomputed_harmony_A = None
-        self.precomputed_harmony_B = None
+        # Precomputed Harmony embeddings for input data
+        self.precomputed_harmony_A_input = None
+        self.precomputed_harmony_B_input = None
         
-        # Deep CCA module (will be initialized during training)
+        # Deep CCA module
         self.deep_cca = None
         
         # Check if harmonypy is available
@@ -101,21 +101,17 @@ class Model(object):
             print(f"Simple batch correction failed: {e}")
             return embeddings
 
-    def _precompute_harmony_embeddings(self):
-        """Precompute Harmony embeddings once at the beginning"""
+    def _precompute_harmony_input_embeddings(self):
+        """Precompute Harmony embeddings for input data once at the beginning"""
         if not self.use_harmony or not self.harmony_available:
             return
             
         try:
-            print("Precomputing Harmony embeddings for entire dataset...")
+            print("Precomputing Harmony embeddings for input data...")
             
-            # Use shared features for Harmony
-            if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
-                feat_A = self.feat_A_MNN
-                feat_B = self.feat_B_MNN
-            else:
-                feat_A = self.emb_A[:, :self.shared_gene_num]
-                feat_B = self.emb_B[:, :self.shared_gene_num]
+            # Use the actual input features for Harmony correction
+            feat_A = self.emb_A
+            feat_B = self.emb_B
             
             # Convert to dense if sparse
             if hasattr(feat_A, 'toarray'):
@@ -126,9 +122,9 @@ class Model(object):
             combined_feats = np.vstack([feat_A, feat_B])
             combined_batches = np.concatenate([self.batch_labels_A, self.batch_labels_B])
             
-            print(f"Precomputing Harmony on {len(combined_feats)} cells...")
+            print(f"Precomputing Harmony on input data: {len(combined_feats)} cells, {combined_feats.shape[1]} features...")
             
-            # Run Harmony once
+            # Run Harmony once on the input data
             batch_str = [f"batch_{int(b)}" for b in combined_batches]
             meta_data = pd.DataFrame({'batch': batch_str})
             vars_use = ['batch']
@@ -145,19 +141,31 @@ class Model(object):
             harmonized_all = ho.Z_corr.T
             
             # Split and store
-            self.precomputed_harmony_A = harmonized_all[:len(feat_A)]
-            self.precomputed_harmony_B = harmonized_all[len(feat_A):]
+            self.precomputed_harmony_A_input = harmonized_all[:len(feat_A)]
+            self.precomputed_harmony_B_input = harmonized_all[len(feat_A):]
             
-            print(f"Precomputed Harmony embeddings: A={self.precomputed_harmony_A.shape}, B={self.precomputed_harmony_B.shape}")
+            print(f"Precomputed Harmony input embeddings: A={self.precomputed_harmony_A_input.shape}, B={self.precomputed_harmony_B_input.shape}")
             
         except Exception as e:
-            print(f"Precomputing Harmony failed: {e}")
-            self.precomputed_harmony_A = None
-            self.precomputed_harmony_B = None
+            print(f"Precomputing Harmony input embeddings failed: {e}")
+            self.precomputed_harmony_A_input = None
+            self.precomputed_harmony_B_input = None
+
+    def _get_harmony_corrected_input(self, index_A, index_B):
+        """Get Harmony-corrected input data for the current batch"""
+        if not self.use_harmony or self.precomputed_harmony_A_input is None or self.precomputed_harmony_B_input is None:
+            # Fallback to original data
+            return (self.emb_A[index_A, :], self.emb_B[index_B, :])
+        
+        # Use precomputed Harmony-corrected input
+        harmony_A_batch = self.precomputed_harmony_A_input[index_A]
+        harmony_B_batch = self.precomputed_harmony_B_input[index_B]
+        
+        return (harmony_A_batch, harmony_B_batch)
 
     def _get_harmonized_mnn_pairs_fast(self, index_A, index_B):
-        """Fast MNN pairs using precomputed Harmony embeddings"""
-        if not self.use_harmony or self.precomputed_harmony_A is None or self.precomputed_harmony_B is None:
+        """Fast MNN pairs using Harmony-corrected input data"""
+        if not self.use_harmony or self.precomputed_harmony_A_input is None or self.precomputed_harmony_B_input is None:
             # Fallback to simple method
             if hasattr(self, 'feat_A_MNN') and hasattr(self, 'feat_B_MNN'):
                 feat_A_batch = self.feat_A_MNN[index_A]
@@ -173,9 +181,9 @@ class Model(object):
                 
             return acquire_pairs(feat_A_batch, feat_B_batch, k=self.n_KNN)
         
-        # Use precomputed Harmony embeddings
-        harmony_A_batch = self.precomputed_harmony_A[index_A]
-        harmony_B_batch = self.precomputed_harmony_B[index_B]
+        # Use precomputed Harmony-corrected input for MNN
+        harmony_A_batch = self.precomputed_harmony_A_input[index_A]
+        harmony_B_batch = self.precomputed_harmony_B_input[index_B]
         
         return acquire_pairs(harmony_A_batch, harmony_B_batch, k=self.n_KNN)
 
@@ -197,7 +205,7 @@ class Model(object):
             combined_feats = np.vstack([feat_A, feat_B])
             combined_batches = np.concatenate([batch_labels_A, batch_labels_B])
             
-            # Use simple batch correction for multi-dataset (faster than full Harmony)
+            # Use simple batch correction for multi-dataset
             corrected_feats = self._simple_batch_correction(combined_feats, combined_batches)
             
             corrected_A = corrected_feats[:len(feat_A)]
@@ -210,9 +218,7 @@ class Model(object):
             return acquire_pairs(feat_A, feat_B, k=self.n_KNN)
 
     def _get_harmonized_mnn_pairs(self, feat_A, feat_B, batch_labels_A, batch_labels_B):
-        """Backward compatibility method - redirects to the new fast method"""
-        # For multi-dataset case, we need to handle it differently
-        # Since we don't have precomputed embeddings for arbitrary pairs
+        """Backward compatibility method"""
         return self._get_harmonized_mnn_pairs_multi(feat_A, feat_B, batch_labels_A, batch_labels_B)
 
     def _apply_deep_cca_alignment(self, z_A, z_B):
@@ -257,8 +263,8 @@ class Model(object):
         self.batch_labels_A = np.zeros(self.emb_A.shape[0])
         self.batch_labels_B = np.ones(self.emb_B.shape[0])
         
-        # Precompute Harmony embeddings
-        self._precompute_harmony_embeddings()
+        # Precompute Harmony embeddings for input data
+        self._precompute_harmony_input_embeddings()
 
     def preprocess_additional_inputs(self, 
                    adata_A_input, 
@@ -267,7 +273,7 @@ class Model(object):
                    layer_adata_A_MNN=None, 
                    layer_adata_B_MNN=None, 
                    ):
-        assert ((layer_adata_A_MNN is not None) or (layer_adata_B_MNN is not None)), "One of the layer names should be feeded; otherwise, use .preprocess() function."
+        assert ((layer_adata_A_MNN is not None) or (layer_adata_B_MNN is not None)), "One of the layer names should be provided; otherwise, use .preprocess() function."
         adata_A = adata_A_input.copy()
         adata_B = adata_B_input.copy()
 
@@ -288,21 +294,21 @@ class Model(object):
         else:
             self.feat_B_MNN = adata_B.obsm[layer_adata_B_MNN]
             
-        # Precompute Harmony embeddings
-        self._precompute_harmony_embeddings()
+        # Precompute Harmony embeddings for input data
+        self._precompute_harmony_input_embeddings()
 
     def train(self):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
-        print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Harmony for input correction: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
         
         # Show precomputation status
         if self.use_harmony:
-            if self.precomputed_harmony_A is not None:
-                print("✓ Using precomputed Harmony embeddings")
+            if self.precomputed_harmony_A_input is not None:
+                print("✓ Using precomputed Harmony-corrected input data")
             else:
-                print("✗ Using fallback batch correction")
+                print("✗ Using original input data (Harmony failed)")
         
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
@@ -338,14 +344,21 @@ class Model(object):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)
-            x_A = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
-            x_B = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
             
-            # Get original latent representations
+            # Get Harmony-corrected input data (applied BEFORE encoding)
+            x_A_harmony, x_B_harmony = self._get_harmony_corrected_input(index_A, index_B)
+            x_A = torch.from_numpy(x_A_harmony).float().to(self.device)
+            x_B = torch.from_numpy(x_B_harmony).float().to(self.device)
+            
+            # Get original data for autoencoder reconstruction loss
+            x_A_original = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
+            x_B_original = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
+            
+            # Get latent representations from Harmony-corrected input
             z_A = self.E_A(x_A)
             z_B = self.E_B(x_B)
             
-            # Apply Deep CCA alignment BEFORE GAN mixing
+            # Apply Deep CCA alignment to latent representations
             z_A_aligned, z_B_aligned, loss_CCA = self._apply_deep_cca_alignment(z_A, z_B)
             
             # Use aligned representations for subsequent computations
@@ -360,6 +373,7 @@ class Model(object):
             z_A_for_disc = z_A_aligned
             z_B_for_disc = z_B_aligned
             
+            # Compute kernels using Harmony-corrected input
             K_A = torch.mean((x_A.view(self.batch_size, 1, -1) - x_A.view(1, self.batch_size, -1))**2, dim=2)
             K_A = torch.exp(-K_A/2)
             K_B_z = torch.mean((z_B_for_disc.view(self.batch_size, 1, -1) - z_B_for_disc.view(1, self.batch_size, -1))**2, dim=2)
@@ -376,9 +390,9 @@ class Model(object):
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
-            # autoencoder loss:
-            loss_AE_A = torch.mean((x_Arecon - x_A)**2)
-            loss_AE_B = torch.mean((x_Brecon - x_B)**2)
+            # autoencoder loss: use original data as target
+            loss_AE_A = torch.mean((x_Arecon - x_A_original)**2)
+            loss_AE_B = torch.mean((x_Brecon - x_B_original)**2)
             loss_AE = loss_AE_A + loss_AE_B
 
             # latent align loss:
@@ -392,7 +406,7 @@ class Model(object):
             # geometric structure loss
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
 
-            # MNN loss - FAST VERSION USING PRECOMPUTED EMBEDDINGS
+            # MNN loss - using Harmony-corrected input for pair calculation
             Sim = self._get_harmonized_mnn_pairs_fast(index_A, index_B)
             Sim = torch.from_numpy(Sim).float().to(self.device)
             z_dist = torch.mean((z_A_aligned.view(self.batch_size, 1, -1) - z_B_aligned.view(1, self.batch_size, -1))**2, dim=2)
@@ -404,7 +418,7 @@ class Model(object):
                      self.lambdaLA * loss_LA + 
                      self.lambdaMNN * loss_MNN + 
                      self.lambdaGeo * loss_Geo +
-                     self.lambdaCCA * loss_CCA)  # Add CCA loss
+                     self.lambdaCCA * loss_CCA)
             
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
@@ -457,8 +471,14 @@ class Model(object):
             self.deep_cca.load_state_dict(checkpoint['deep_cca'])
             print("Deep CCA loaded from checkpoint")
 
-        x_A = torch.from_numpy(self.emb_A).float().to(self.device)
-        x_B = torch.from_numpy(self.emb_B).float().to(self.device)
+        # Use Harmony-corrected input during evaluation if available
+        if self.use_harmony and self.precomputed_harmony_A_input is not None and self.precomputed_harmony_B_input is not None:
+            x_A = torch.from_numpy(self.precomputed_harmony_A_input).float().to(self.device)
+            x_B = torch.from_numpy(self.precomputed_harmony_B_input).float().to(self.device)
+            print("Using Harmony-corrected input for evaluation")
+        else:
+            x_A = torch.from_numpy(self.emb_A).float().to(self.device)
+            x_B = torch.from_numpy(self.emb_B).float().to(self.device)
 
         z_A = self.E_A(x_A)
         z_B = self.E_B(x_B)
@@ -483,7 +503,7 @@ class Model(object):
         self.data_Bspace = np.concatenate((x_AtoB.detach().cpu().numpy(), self.emb_B), axis=0)
 
     def get_imputed_df(self, 
-                       scale = 'scaled' # if scale=='log', then restore expression after log1p
+                       scale = 'scaled'
                        ):
 
         x_BtoA = self.data_Aspace[self.emb_A.shape[0]:]
@@ -498,14 +518,14 @@ class Model(object):
         self.imputed_df_BtoA = imputed_df_BtoA
         self.imputed_df_AtoB = imputed_df_AtoB
 
-    def integrate_datasets_links(self, # Use this function for N >= 3 datasets when provided features links for MNN
+    def integrate_datasets_links(self,
                                  input_feats,
-                                 feat_links_MNN, # A list of index pairs for feature linkages between features in "inputs_MNN"
-                                 input_MNN=None, # A list of features matrices for finding MNN pairs between datasets; set as the same as input_feats if "input_MNN=None"
+                                 feat_links_MNN,
+                                 input_MNN=None,
                                  ):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
-        print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Harmony for input correction: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
         
         num_datasets = len(input_feats)
@@ -548,11 +568,45 @@ class Model(object):
             for i in range(num_datasets-1):
                 self.deep_cca_dict[i].train()
 
+        # Precompute Harmony embeddings for multi-dataset input if enabled
+        harmony_input_dict = {}
+        if self.use_harmony and self.harmony_available:
+            try:
+                print("Precomputing Harmony embeddings for multi-dataset input...")
+                combined_feats = np.vstack(input_feats)
+                combined_batches = np.concatenate([np.full(feat.shape[0], i) for i, feat in enumerate(input_feats)])
+                
+                batch_str = [f"batch_{int(b)}" for b in combined_batches]
+                meta_data = pd.DataFrame({'batch': batch_str})
+                vars_use = ['batch']
+                
+                ho = self.hm.run_harmony(
+                    combined_feats, 
+                    meta_data, 
+                    vars_use,
+                    max_iter_harmony=self.harmony_max_iter_harmony,
+                    sigma=self.harmony_sigma,
+                    theta=self.harmony_theta
+                )
+                
+                harmonized_all = ho.Z_corr.T
+                
+                # Split by dataset
+                start_idx = 0
+                for i, feat in enumerate(input_feats):
+                    end_idx = start_idx + feat.shape[0]
+                    harmony_input_dict[i] = harmonized_all[start_idx:end_idx]
+                    start_idx = end_idx
+                print("Multi-dataset Harmony input embeddings computed successfully")
+            except Exception as e:
+                print(f"Multi-dataset Harmony input precomputation failed: {e}")
+
         for step in range(self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
+            x_original_dict = {}
             z_dict = {}
-            z_aligned_dict = {}  # For Deep CCA aligned representations
+            z_aligned_dict = {}
             K_dict = {}
             K_z_dict = {}
             if input_MNN != None:
@@ -560,7 +614,16 @@ class Model(object):
                 x_MNN_dict = {}
             for i in range(num_datasets):
                 index_i = np.random.choice(np.arange(input_feats[i].shape[0]), size=self.batch_size)
-                x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
+                # Use Harmony-corrected input if available
+                if i in harmony_input_dict:
+                    x_dict[i] = torch.from_numpy(harmony_input_dict[i][index_i, :]).float().to(self.device)
+                else:
+                    x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
+                # Store original data for reconstruction loss
+                x_original_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
                 if input_MNN != None:
                     assert input_MNN[i].shape[0] == input_feats[i].shape[0]
                     x_MNN_dict[i] = input_MNN[i][index_i, :]
@@ -575,13 +638,11 @@ class Model(object):
                     z_i_aligned, z_i1_aligned, loss_CCA = self._apply_deep_cca_alignment_multi(
                         z_dict[i], z_dict[i+1], self.deep_cca_dict[i]
                     )
-                    # Store aligned representations
                     if i == 0:
                         z_aligned_dict[i] = z_i_aligned
                     z_aligned_dict[i+1] = z_i1_aligned
                     loss_CCA_total += loss_CCA
             else:
-                # If no Deep CCA, use original representations
                 for i in range(num_datasets):
                     z_aligned_dict[i] = z_dict[i]
 
@@ -590,17 +651,16 @@ class Model(object):
                 optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
-                    # Use aligned representations for discriminator
                     z_i = z_aligned_dict[i]
                     z_i1 = z_aligned_dict[i+1]
                     loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
-            # autoencoder loss:
+            # autoencoder loss: use original data as target
             loss_AE = 0
             for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_dict[i])**2)
+                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_original_dict[i])**2)
 
             # latent align loss:
             loss_LA = 0
@@ -620,15 +680,13 @@ class Model(object):
             for i in range(num_datasets):
                 loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
 
-            # MNN loss - UPDATED WITH HARMONY
+            # MNN loss
             loss_MNN = 0
             for i in range(num_datasets-1):
                 if input_MNN != None:
-                    # Create batch labels for this pair
                     batch_labels_i = np.zeros(self.batch_size)
                     batch_labels_i1 = np.ones(self.batch_size)
                     
-                    # Use harmonized MNN pairs
                     Sim = self._get_harmonized_mnn_pairs(
                         x_MNN_dict[i][:, feat_links_MNN[i][0]], 
                         x_MNN_dict[i+1][:, feat_links_MNN[i][1]],
@@ -636,11 +694,9 @@ class Model(object):
                         batch_labels_i1
                     )
                 else:
-                    # Create batch labels for this pair
                     batch_labels_i = np.zeros(self.batch_size)
                     batch_labels_i1 = np.ones(self.batch_size)
                     
-                    # Use harmonized MNN pairs
                     Sim = self._get_harmonized_mnn_pairs(
                         x_dict[i][:, feat_links_MNN[i][0]], 
                         x_dict[i+1][:, feat_links_MNN[i][1]],
@@ -648,7 +704,6 @@ class Model(object):
                         batch_labels_i1
                     )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
-                # Use aligned representations for MNN loss
                 z_dist = torch.mean((z_aligned_dict[i].view(self.batch_size, 1, -1) - z_aligned_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
@@ -658,7 +713,7 @@ class Model(object):
                      self.lambdaLA * loss_LA + 
                      self.lambdaMNN * loss_MNN + 
                      self.lambdaGeo * loss_Geo +
-                     self.lambdaCCA * loss_CCA_total)  # Add CCA loss
+                     self.lambdaCCA * loss_CCA_total)
             
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
@@ -679,7 +734,10 @@ class Model(object):
 
         for i in range(num_datasets):
             self.E_dict[i].train()
-            z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
+            if i in harmony_input_dict:
+                z_dict[i] = self.E_dict[i](torch.from_numpy(harmony_input_dict[i]).float().to(self.device))
+            else:
+                z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
 
         print("Ending time: ", time.asctime(time.localtime(end_time)))
         self.eval_time = end_time - begin_time
@@ -693,33 +751,25 @@ class Model(object):
             return z_A, z_B, torch.tensor(0.0).to(self.device)
         
         try:
-            # Apply Deep CCA projection
             projected_A, projected_B = deep_cca_module(z_A, z_B)
-            
-            # Compute CCA loss
             cca_loss = deep_cca_loss(projected_A, projected_B)
-            
-            # Compute CCA-aligned representations using traditional CCA
             z_A_aligned, z_B_aligned = compute_cca_alignment(projected_A, projected_B, cca_dim=self.cca_dim)
-            
-            # Mix original and CCA-aligned representations
             mixing_ratio = self.cca_mixing_ratio
             z_A_mixed = (1 - mixing_ratio) * z_A + mixing_ratio * z_A_aligned
             z_B_mixed = (1 - mixing_ratio) * z_B + mixing_ratio * z_B_aligned
-            
             return z_A_mixed, z_B_mixed, cca_loss
             
         except Exception as e:
             print(f"Deep CCA alignment failed: {e}")
             return z_A, z_B, torch.tensor(0.0).to(self.device)
 
-    def integrate_datasets_feats(self, # Use this function for N >= 3 datasets when provided linked features for MNN
+    def integrate_datasets_feats(self,
                                  input_feats,
-                                 paired_input_MNN, # In the form of [[link_feat_data1, link_feat_data2], ..., [link_feat_data(N_1), link_feat_dataN]]
+                                 paired_input_MNN,
                                  ):
         begin_time = time.time()
         print("Beginning time: ", time.asctime(time.localtime(begin_time)))
-        print(f"Using Harmony for MNN: {self.use_harmony}")
+        print(f"Using Harmony for input correction: {self.use_harmony}")
         print(f"Using Deep CCA: {self.use_deep_cca}")
         
         num_datasets = len(input_feats)
@@ -732,7 +782,6 @@ class Model(object):
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
         
-        # Initialize Deep CCA modules for each consecutive pair if enabled
         self.deep_cca_dict = {}
         if self.use_deep_cca:
             for i in range(num_datasets-1):
@@ -761,11 +810,44 @@ class Model(object):
             for i in range(num_datasets-1):
                 self.deep_cca_dict[i].train()
 
+        # Precompute Harmony embeddings for multi-dataset input
+        harmony_input_dict = {}
+        if self.use_harmony and self.harmony_available:
+            try:
+                print("Precomputing Harmony embeddings for multi-dataset input...")
+                combined_feats = np.vstack(input_feats)
+                combined_batches = np.concatenate([np.full(feat.shape[0], i) for i, feat in enumerate(input_feats)])
+                
+                batch_str = [f"batch_{int(b)}" for b in combined_batches]
+                meta_data = pd.DataFrame({'batch': batch_str})
+                vars_use = ['batch']
+                
+                ho = self.hm.run_harmony(
+                    combined_feats, 
+                    meta_data, 
+                    vars_use,
+                    max_iter_harmony=self.harmony_max_iter_harmony,
+                    sigma=self.harmony_sigma,
+                    theta=self.harmony_theta
+                )
+                
+                harmonized_all = ho.Z_corr.T
+                
+                start_idx = 0
+                for i, feat in enumerate(input_feats):
+                    end_idx = start_idx + feat.shape[0]
+                    harmony_input_dict[i] = harmonized_all[start_idx:end_idx]
+                    start_idx = end_idx
+                print("Multi-dataset Harmony input embeddings computed successfully")
+            except Exception as e:
+                print(f"Multi-dataset Harmony input precomputation failed: {e}")
+
         for step in range(self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
+            x_original_dict = {}
             z_dict = {}
-            z_aligned_dict = {}  # For Deep CCA aligned representations
+            z_aligned_dict = {}
             K_dict = {}
             K_z_dict = {}
             assert len(paired_input_MNN) == (num_datasets - 1)
@@ -773,7 +855,14 @@ class Model(object):
             x_MNN_dict_1 = {}
             for i in range(num_datasets):
                 index_i = np.random.choice(np.arange(input_feats[i].shape[0]), size=self.batch_size)
-                x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
+                if i in harmony_input_dict:
+                    x_dict[i] = torch.from_numpy(harmony_input_dict[i][index_i, :]).float().to(self.device)
+                else:
+                    x_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
+                x_original_dict[i] = torch.from_numpy(input_feats[i][index_i, :]).float().to(self.device)
+                
                 if i < (num_datasets-1):
                     x_MNN_dict_0[i] = paired_input_MNN[i][0][index_i, :]
                 if i > 0:
@@ -782,66 +871,54 @@ class Model(object):
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
 
-            # Apply Deep CCA alignment for each consecutive pair
             loss_CCA_total = torch.tensor(0.0).to(self.device)
             if self.use_deep_cca:
                 for i in range(num_datasets-1):
                     z_i_aligned, z_i1_aligned, loss_CCA = self._apply_deep_cca_alignment_multi(
                         z_dict[i], z_dict[i+1], self.deep_cca_dict[i]
                     )
-                    # Store aligned representations
                     if i == 0:
                         z_aligned_dict[i] = z_i_aligned
                     z_aligned_dict[i+1] = z_i1_aligned
                     loss_CCA_total += loss_CCA
             else:
-                # If no Deep CCA, use original representations
                 for i in range(num_datasets):
                     z_aligned_dict[i] = z_dict[i]
 
-            # discriminator loss:
             for _ in range(5):
                 optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
-                    # Use aligned representations for discriminator
                     z_i = z_aligned_dict[i]
                     z_i1 = z_aligned_dict[i+1]
                     loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
                 loss_D.backward(retain_graph=True)
                 optimizer_D.step()
 
-            # autoencoder loss:
             loss_AE = 0
             for i in range(num_datasets):
-                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_dict[i])**2)
+                loss_AE += torch.mean((self.G_dict[i](z_aligned_dict[i]) - x_original_dict[i])**2)
 
-            # latent align loss:
             loss_LA = 0
             for i in range(num_datasets-1):
                 loss_LA += torch.mean((z_aligned_dict[i] - self.E_dict[i+1](self.G_dict[i+1](z_aligned_dict[i])))**2)
                 loss_LA += torch.mean((z_aligned_dict[i+1] - self.E_dict[i](self.G_dict[i](z_aligned_dict[i+1])))**2)
 
-            # generator loss
             loss_G_GAN = 0
             for i in range(num_datasets-1):
                 z_i = z_aligned_dict[i]
                 z_i1 = z_aligned_dict[i+1]
                 loss_G_GAN += -(torch.log(1 + torch.exp(-self.D_dict[i](z_i))) + torch.log(1 + torch.exp(self.D_dict[i](z_i1)))).mean()
 
-            # geometric structure loss
             loss_Geo = 0
             for i in range(num_datasets):
                 loss_Geo += - torch.clamp(cos(K_dict[i], K_z_dict[i]), max=0.975).mean()
 
-            # MNN loss - UPDATED WITH HARMONY
             loss_MNN = 0
             for i in range(num_datasets-1):
-                # Create batch labels for this pair
                 batch_labels_0 = np.zeros(self.batch_size)
                 batch_labels_1 = np.ones(self.batch_size)
                 
-                # Use harmonized MNN pairs
                 Sim = self._get_harmonized_mnn_pairs(
                     x_MNN_dict_0[i], 
                     x_MNN_dict_1[i], 
@@ -849,7 +926,6 @@ class Model(object):
                     batch_labels_1
                 )
                 Sim = torch.from_numpy(Sim).float().to(self.device)
-                # Use aligned representations for MNN loss
                 z_dist = torch.mean((z_aligned_dict[i].view(self.batch_size, 1, -1) - z_aligned_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
@@ -859,7 +935,7 @@ class Model(object):
                      self.lambdaLA * loss_LA + 
                      self.lambdaMNN * loss_MNN + 
                      self.lambdaGeo * loss_Geo +
-                     self.lambdaCCA * loss_CCA_total)  # Add CCA loss
+                     self.lambdaCCA * loss_CCA_total)
             
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
@@ -880,7 +956,10 @@ class Model(object):
 
         for i in range(num_datasets):
             self.E_dict[i].train()
-            z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
+            if i in harmony_input_dict:
+                z_dict[i] = self.E_dict[i](torch.from_numpy(harmony_input_dict[i]).float().to(self.device))
+            else:
+                z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
 
         print("Ending time: ", time.asctime(time.localtime(end_time)))
         self.eval_time = end_time - begin_time
@@ -896,7 +975,6 @@ class Model(object):
             state['E_%d' % i] = self.E_dict[i].state_dict()
             state['G_%d' % i] = self.G_dict[i].state_dict()
         
-        # Save Deep CCA states if used
         if self.use_deep_cca:
             for i in range(num_datasets-1):
                 state['deep_cca_%d' % i] = self.deep_cca_dict[i].state_dict()
