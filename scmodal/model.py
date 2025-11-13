@@ -13,7 +13,8 @@ from scmodal.utils import *
 
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
-                 lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, lambdaGAN = 1.0, n_KNN = 30,
+                 lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
+                 lambdaGAN = 1.0, lambdaDCCA = 5.0, n_KNN = 30, use_dcca=False,
                  model_path="models", data_path="data", result_path="results"):
 
         # add device
@@ -34,7 +35,9 @@ class Model(object):
         self.lambdaMNN = lambdaMNN
         self.lambdaGeo = lambdaGeo
         self.lambdaGAN = lambdaGAN
+        self.lambdaDCCA = lambdaDCCA
         self.n_KNN = n_KNN
+        self.use_dcca = use_dcca  # Flag to enable/disable DCCA
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -83,19 +86,32 @@ class Model(object):
     def train(self):
         begin_time = time.time()
         print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.D_Z = discriminator(self.n_latent).to(self.device)
-        params_G = list(self.E_A.parameters()) + list(self.E_B.parameters()) + list(self.G_A.parameters()) + list(self.G_B.parameters())
+        
+        # Initialize Deep CCA if enabled
+        if self.use_dcca:
+            self.dcca = DeepCCA(self.n_latent, self.n_latent, self.n_latent).to(self.device)
+            params_dcca = list(self.dcca.parameters())
+        else:
+            params_dcca = []
+            
+        params_G = list(self.E_A.parameters()) + list(self.E_B.parameters()) + \
+                  list(self.G_A.parameters()) + list(self.G_B.parameters()) + params_dcca
         optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
         optimizer_D = optim.Adam(list(self.D_Z.parameters()), lr=0.001, weight_decay=0.001)
+        
         self.E_A.train()
         self.E_B.train()
         self.G_A.train()
         self.G_B.train()
         self.D_Z.train()
+        if self.use_dcca:
+            self.dcca.train()
 
         N_A = self.emb_A.shape[0]
         N_B = self.emb_B.shape[0]
@@ -106,14 +122,48 @@ class Model(object):
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)
             x_A = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
             x_B = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
-            z_A = self.E_A(x_A)
-            z_B = self.E_B(x_B)
+            
+            # Step 1: Get encoder latent representations
+            z_A_encoder = self.E_A(x_A)
+            z_B_encoder = self.E_B(x_B)
+            
+            # Step 2: Pass through Deep CCA to get correlated representations
+            if self.use_dcca:
+                z_A_dcca, z_B_dcca = self.dcca(z_A_encoder, z_B_encoder)
+                # Use DCCA representations for the rest of the pipeline
+                z_A = z_A_dcca
+                z_B = z_B_dcca
+            else:
+                # Use encoder representations directly if DCCA is disabled
+                z_A = z_A_encoder
+                z_B = z_B_encoder
+            
+            # Step 3: Generate cross-modal data using DCCA representations
             x_AtoB = self.G_B(z_A)
             x_BtoA = self.G_A(z_B)
+            
+            # Step 4: Reconstruct original data
             x_Arecon = self.G_A(z_A)
             x_Brecon = self.G_B(z_B)
-            z_AtoB = self.E_B(x_AtoB)
-            z_BtoA = self.E_A(x_BtoA)
+            
+            # Step 5: Encode the generated cross-modal data
+            z_AtoB_encoder = self.E_B(x_AtoB)
+            z_BtoA_encoder = self.E_A(x_BtoA)
+            
+            # Step 6: Pass encoded cross-modal data through DCCA
+            if self.use_dcca:
+                z_AtoB_dcca, _ = self.dcca(z_AtoB_encoder, z_B_encoder)  # Use B as second input for consistency
+                _, z_BtoA_dcca = self.dcca(z_A_encoder, z_BtoA_encoder)  # Use A as first input for consistency
+                
+                # Use DCCA representations for latent alignment
+                z_AtoB = z_AtoB_dcca
+                z_BtoA = z_BtoA_dcca
+            else:
+                # Use encoder representations directly if DCCA is disabled
+                z_AtoB = z_AtoB_encoder
+                z_BtoA = z_BtoA_encoder
+            
+            # Compute kernels for geometric structure loss
             K_A = torch.mean((x_A.view(self.batch_size, 1, -1) - x_A.view(1, self.batch_size, -1))**2, dim=2)
             K_A = torch.exp(-K_A/2)
             K_B_z = torch.mean((z_B.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
@@ -135,32 +185,53 @@ class Model(object):
             loss_AE_B = torch.mean((x_Brecon - x_B)**2)
             loss_AE = loss_AE_A + loss_AE_B
 
-            # latent align loss:
+            # latent align loss: NOW USING DCCA REPRESENTATIONS
             loss_LA_AtoB = torch.mean((z_A - z_AtoB)**2)
             loss_LA_BtoA = torch.mean((z_B - z_BtoA)**2)
             loss_LA = loss_LA_AtoB + loss_LA_BtoA
 
-            # generator loss
+            # generator loss (using DCCA representations)
             loss_G_GAN = -(torch.log(1 + torch.exp(-self.D_Z(z_A))) + torch.log(1 + torch.exp(self.D_Z(z_B)))).mean()
 
-            # geometric structure loss
+            # geometric structure loss (using DCCA representations)
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
 
-            # MNN loss
+            # MNN loss (using DCCA representations)
             Sim = acquire_pairs(self.emb_A[index_A, :self.shared_gene_num], self.emb_B[index_B, :self.shared_gene_num], k=self.n_KNN)
             Sim = torch.from_numpy(Sim).float().to(self.device)
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
 
+            # DCCA correlation loss (if enabled)
+            loss_DCCA = 0
+            if self.use_dcca:
+                loss_DCCA = deep_cca_loss(z_A_encoder, z_B_encoder, z_A_dcca, z_B_dcca)
+
             optimizer_G.zero_grad()
-            loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
+            
+            # Combine all losses
+            loss_G = (self.lambdaGAN * loss_G_GAN + 
+                     self.lambdaAE * loss_AE + 
+                     self.lambdaLA * loss_LA + 
+                     self.lambdaMNN * loss_MNN + 
+                     self.lambdaGeo * loss_Geo)
+            
+            if self.use_dcca:
+                loss_G += self.lambdaDCCA * loss_DCCA
+            
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
             if not step % 2000:
-                print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                log_message = "step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f" % (
+                    step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, 
+                    self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN)
+                
+                if self.use_dcca:
+                    log_message += ", loss_DCCA=%f" % (self.lambdaDCCA * loss_DCCA)
+                
+                print(log_message)
 
         end_time = time.time()
         print("Ending time: ", time.asctime(time.localtime(end_time)))
@@ -172,6 +243,9 @@ class Model(object):
 
         state = {'E_A': self.E_A.state_dict(), 'E_B': self.E_B.state_dict(),
                  'G_A': self.G_A.state_dict(), 'G_B': self.G_B.state_dict()}
+        
+        if self.use_dcca:
+            state['dcca'] = self.dcca.state_dict()
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
 
@@ -184,16 +258,30 @@ class Model(object):
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
-        self.E_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_A'])
-        self.E_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['E_B'])
-        self.G_A.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_A'])
-        self.G_B.load_state_dict(torch.load(os.path.join(self.model_path, "ckpt.pth"))['G_B'])
+        
+        checkpoint = torch.load(os.path.join(self.model_path, "ckpt.pth"))
+        self.E_A.load_state_dict(checkpoint['E_A'])
+        self.E_B.load_state_dict(checkpoint['E_B'])
+        self.G_A.load_state_dict(checkpoint['G_A'])
+        self.G_B.load_state_dict(checkpoint['G_B'])
+        
+        # Load DCCA if it exists in checkpoint
+        if self.use_dcca and 'dcca' in checkpoint:
+            self.dcca = DeepCCA(self.n_latent, self.n_latent, self.n_latent).to(self.device)
+            self.dcca.load_state_dict(checkpoint['dcca'])
 
         x_A = torch.from_numpy(self.emb_A).float().to(self.device)
         x_B = torch.from_numpy(self.emb_B).float().to(self.device)
 
-        z_A = self.E_A(x_A)
-        z_B = self.E_B(x_B)
+        # Get encoder representations
+        z_A_encoder = self.E_A(x_A)
+        z_B_encoder = self.E_B(x_B)
+        
+        # Pass through DCCA if enabled
+        if self.use_dcca and hasattr(self, 'dcca'):
+            z_A, z_B = self.dcca(z_A_encoder, z_B_encoder)
+        else:
+            z_A, z_B = z_A_encoder, z_B_encoder
 
         x_AtoB = self.G_B(z_A)
         x_BtoA = self.G_A(z_B)
