@@ -10,61 +10,64 @@ from sklearn.neighbors import NearestNeighbors
 from scipy.spatial.distance import cdist
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class DeepCCA(nn.Module):
     """
     Deep Canonical Correlation Analysis (Deep CCA) layer
+    Takes encoder latent representations and learns correlated features
     """
     def __init__(self, input_dim1, input_dim2, latent_dim, hidden_dims=[512, 256]):
         super(DeepCCA, self).__init__()
         self.latent_dim = latent_dim
         
-        # Encoder for modality A
-        encoder_layers_A = []
+        # Transformation network for modality A (encoder latent -> DCCA latent)
+        transform_layers_A = []
         prev_dim = input_dim1
         for hidden_dim in hidden_dims:
-            encoder_layers_A.extend([
+            transform_layers_A.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(0.1)
             ])
             prev_dim = hidden_dim
-        encoder_layers_A.append(nn.Linear(prev_dim, latent_dim))
-        self.encoder_A = nn.Sequential(*encoder_layers_A)
+        transform_layers_A.append(nn.Linear(prev_dim, latent_dim))
+        self.transform_A = nn.Sequential(*transform_layers_A)
         
-        # Encoder for modality B
-        encoder_layers_B = []
+        # Transformation network for modality B (encoder latent -> DCCA latent)
+        transform_layers_B = []
         prev_dim = input_dim2
         for hidden_dim in hidden_dims:
-            encoder_layers_B.extend([
+            transform_layers_B.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(0.1)
             ])
             prev_dim = hidden_dim
-        encoder_layers_B.append(nn.Linear(prev_dim, latent_dim))
-        self.encoder_B = nn.Sequential(*encoder_layers_B)
+        transform_layers_B.append(nn.Linear(prev_dim, latent_dim))
+        self.transform_B = nn.Sequential(*transform_layers_B)
         
-    def forward(self, x1, x2):
-        z1 = self.encoder_A(x1)
-        z2 = self.encoder_B(x2)
-        return z1, z2
+    def forward(self, z1, z2):
+        z1_dcca = self.transform_A(z1)
+        z2_dcca = self.transform_B(z2)
+        return z1_dcca, z2_dcca
 
-def deep_cca_loss(z1, z2, r1=1e-4, r2=1e-4):
+def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4):
     """
-    Compute Deep CCA loss - correlation between latent representations
+    Compute Deep CCA loss - correlation between DCCA representations
+    with alignment to encoder representations
     """
-    # Center the embeddings
-    z1 = z1 - z1.mean(dim=0)
-    z2 = z2 - z2.mean(dim=0)
+    # Center the DCCA embeddings
+    z1_dcca_centered = z1_dcca - z1_dcca.mean(dim=0)
+    z2_dcca_centered = z2_dcca - z2_dcca.mean(dim=0)
     
     # Compute covariance matrices
-    n = z1.size(0)
-    c11 = (z1.T @ z1) / (n - 1) + r1 * torch.eye(z1.size(1), device=z1.device)
-    c22 = (z2.T @ z2) / (n - 1) + r2 * torch.eye(z2.size(1), device=z2.device)
-    c12 = (z1.T @ z2) / (n - 1)
+    n = z1_dcca.size(0)
+    c11 = (z1_dcca_centered.T @ z1_dcca_centered) / (n - 1) + r1 * torch.eye(z1_dcca.size(1), device=z1_dcca.device)
+    c22 = (z2_dcca_centered.T @ z2_dcca_centered) / (n - 1) + r2 * torch.eye(z2_dcca.size(1), device=z2_dcca.device)
+    c12 = (z1_dcca_centered.T @ z2_dcca_centered) / (n - 1)
     
     # Solve the generalized eigenvalue problem
     c11_inv = torch.linalg.inv(c11)
@@ -75,25 +78,9 @@ def deep_cca_loss(z1, z2, r1=1e-4, r2=1e-4):
     eigenvalues = torch.linalg.eigvals(T).real
     
     # Return negative sum of top correlations (to maximize correlation)
-    return -torch.sum(torch.sqrt(eigenvalues[:min(z1.size(1), z2.size(1))]))
-
-def compute_latent_alignment_loss(z_encoder, z_dcca, method='mse'):
-    """
-    Compute alignment loss between encoder latent space and DCCA latent space
-    """
-    if method == 'mse':
-        return F.mse_loss(z_encoder, z_dcca)
-    elif method == 'cosine':
-        cos = nn.CosineSimilarity(dim=1)
-        return 1 - cos(z_encoder, z_dcca).mean()
-    elif method == 'combined':
-        mse_loss = F.mse_loss(z_encoder, z_dcca)
-        cos = nn.CosineSimilarity(dim=1)
-        cos_loss = 1 - cos(z_encoder, z_dcca).mean()
-        return 0.5 * mse_loss + 0.5 * cos_loss
-    else:
-        raise ValueError(f"Unknown alignment loss method: {method}")
-
+    correlation_loss = -torch.sum(torch.sqrt(eigenvalues[:min(z1_dcca.size(1), z2_dcca.size(1))]))
+    
+    return correlation_loss
 
 def acquire_pairs(X, Y, k=30, metric='angular'):
     # This function was modified from iMAP: https://github.com/Svvord/iMAP/blob/master/imap/stage2.py
@@ -150,4 +137,3 @@ def compute_umap(adata, rep=None):
         X_umap = reducer.fit_transform(adata.obsm[rep])
 
     adata.obsm['X_umap'] = X_umap
-
