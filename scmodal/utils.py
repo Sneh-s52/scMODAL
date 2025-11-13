@@ -54,31 +54,48 @@ class DeepCCA(nn.Module):
         z2_dcca = self.transform_B(z2)
         return z1_dcca, z2_dcca
 
-def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4):
+def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-2, r2=1e-2):
     """
-    Compute Deep CCA loss - correlation between DCCA representations
-    with alignment to encoder representations
+    Stable Deep CCA loss with better numerical properties
     """
-    # Center the DCCA embeddings
+    batch_size, latent_dim = z1_dcca.shape
+    
+    # Center the embeddings
     z1_dcca_centered = z1_dcca - z1_dcca.mean(dim=0)
     z2_dcca_centered = z2_dcca - z2_dcca.mean(dim=0)
     
-    # Compute covariance matrices
-    n = z1_dcca.size(0)
-    c11 = (z1_dcca_centered.T @ z1_dcca_centered) / (n - 1) + r1 * torch.eye(z1_dcca.size(1), device=z1_dcca.device)
-    c22 = (z2_dcca_centered.T @ z2_dcca_centered) / (n - 1) + r2 * torch.eye(z2_dcca.size(1), device=z2_dcca.device)
-    c12 = (z1_dcca_centered.T @ z2_dcca_centered) / (n - 1)
+    # Compute covariance matrices with stronger regularization
+    c11 = (z1_dcca_centered.T @ z1_dcca_centered) / (batch_size - 1) 
+    c22 = (z2_dcca_centered.T @ z2_dcca_centered) / (batch_size - 1)
+    c12 = (z1_dcca_centered.T @ z2_dcca_centered) / (batch_size - 1)
     
-    # Solve the generalized eigenvalue problem
-    c11_inv = torch.linalg.inv(c11)
-    c22_inv = torch.linalg.inv(c22)
+    # Add regularization to diagonals
+    c11_reg = c11 + r1 * torch.eye(latent_dim, device=z1_dcca.device)
+    c22_reg = c22 + r2 * torch.eye(latent_dim, device=z2_dcca.device)
+    
+    # Use pseudoinverse for stability
+    try:
+        c11_inv = torch.linalg.inv(c11_reg)
+        c22_inv = torch.linalg.inv(c22_reg)
+    except:
+        c11_inv = torch.linalg.pinv(c11_reg)
+        c22_inv = torch.linalg.pinv(c22_reg)
+    
+    # Compute the matrix for generalized eigenvalue problem
     T = c11_inv @ c12 @ c22_inv @ c12.T
     
     # Get eigenvalues (correlations)
-    eigenvalues = torch.linalg.eigvals(T).real
-    
-    # Return negative sum of top correlations (to maximize correlation)
-    correlation_loss = -torch.sum(torch.sqrt(eigenvalues[:min(z1_dcca.size(1), z2_dcca.size(1))]))
+    try:
+        eigenvalues = torch.linalg.eigvals(T).real
+        # Use only positive eigenvalues and avoid numerical issues
+        eigenvalues = eigenvalues[eigenvalues > 1e-8]
+        if len(eigenvalues) == 0:
+            return torch.tensor(0.0, device=z1_dcca.device)
+        correlation_loss = -torch.sum(torch.sqrt(eigenvalues))
+    except:
+        # Fallback: simple correlation loss
+        correlation = torch.sum(z1_dcca_centered * z2_dcca_centered) / (batch_size - 1)
+        correlation_loss = -correlation
     
     return correlation_loss
 
