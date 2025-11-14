@@ -14,8 +14,8 @@ from scmodal.utils import *
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
-                 lambdaGAN = 1.0, lambdaDCCA = 5.0, n_KNN = 30, use_dcca=False,
-                 dcca_r1=1e-4, dcca_r2=1e-4, dcca_use_all_singular_values=True,
+                 lambdaGAN = 1.0, lambdaDCCA = 0.5, n_KNN = 30, use_dcca=False,
+                 dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=True,
                  model_path="models", data_path="data", result_path="results"):
 
         # add device

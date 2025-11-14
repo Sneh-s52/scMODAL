@@ -22,7 +22,7 @@ class DeepCCA(nn.Module):
     Takes encoder latent representations and learns correlated features by
     maximizing the sum of canonical correlations between the two modalities.
     """
-    def __init__(self, input_dim1, input_dim2, latent_dim, hidden_dims=[512, 256]):
+    def __init__(self, input_dim1, input_dim2, latent_dim, hidden_dims=[512, 256], use_batch_norm=True):
         super(DeepCCA, self).__init__()
         self.latent_dim = latent_dim
         
@@ -30,12 +30,20 @@ class DeepCCA(nn.Module):
         transform_layers_A = []
         prev_dim = input_dim1
         for hidden_dim in hidden_dims:
-            transform_layers_A.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),  # More stable than BatchNorm for variable batch sizes
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ])
+            if use_batch_norm:
+                transform_layers_A.extend([
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ])
+            else:
+                transform_layers_A.extend([
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ])
             prev_dim = hidden_dim
         transform_layers_A.append(nn.Linear(prev_dim, latent_dim))
         self.transform_A = nn.Sequential(*transform_layers_A)
@@ -44,12 +52,20 @@ class DeepCCA(nn.Module):
         transform_layers_B = []
         prev_dim = input_dim2
         for hidden_dim in hidden_dims:
-            transform_layers_B.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),  # More stable than BatchNorm for variable batch sizes
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ])
+            if use_batch_norm:
+                transform_layers_B.extend([
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ])
+            else:
+                transform_layers_B.extend([
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ])
             prev_dim = hidden_dim
         transform_layers_B.append(nn.Linear(prev_dim, latent_dim))
         self.transform_B = nn.Sequential(*transform_layers_B)
@@ -60,7 +76,7 @@ class DeepCCA(nn.Module):
         return z1_dcca, z2_dcca
 
 
-def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4, use_all_singular_values=True):
+def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-5, r2=1e-5, use_all_singular_values=True):
     """
     Deep CCA loss function that maximizes canonical correlations.
     
@@ -76,12 +92,13 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4, us
         z2_encoder: Encoder output for modality 2 (not used in loss, kept for API compatibility)
         z1_dcca: DCCA-transformed output for modality 1
         z2_dcca: DCCA-transformed output for modality 2
-        r1: Regularization parameter for covariance matrix of modality 1
-        r2: Regularization parameter for covariance matrix of modality 2
+        r1: Regularization parameter for covariance matrix of modality 1 (default: 1e-5)
+        r2: Regularization parameter for covariance matrix of modality 2 (default: 1e-5)
         use_all_singular_values: If True, use all singular values; if False, use only top-k
     
     Returns:
-        Negative trace (to maximize correlation via minimization)
+        Negative trace scaled by 1/latent_dim (to maximize correlation via minimization)
+        The scaling ensures the loss magnitude is comparable to other losses.
     """
     batch_size, latent_dim = z1_dcca.shape
     
@@ -101,31 +118,23 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4, us
     )
     C12 = (z1_dcca_centered.T @ z2_dcca_centered) / (batch_size - 1)
     
+    # Compute T = C11^(-1/2) * C12 * C22^(-1/2) using SVD for numerical stability
+    # This is more stable than Cholesky for the matrix square root
+    eps = 1e-8
+    
+    # Compute C11^(-1/2) using SVD: C11 = U1 * S1 * V1^T, so C11^(-1/2) = U1 * diag(1/sqrt(S1)) * V1^T
+    U1, S1, V1 = torch.linalg.svd(C11)
+    # Ensure eigenvalues are positive (should be with regularization)
+    S1 = torch.clamp(S1, min=eps)
+    C11_inv_sqrt = U1 @ torch.diag_embed(1.0 / torch.sqrt(S1)) @ V1.T
+    
+    # Compute C22^(-1/2) similarly
+    U2, S2, V2 = torch.linalg.svd(C22)
+    S2 = torch.clamp(S2, min=eps)
+    C22_inv_sqrt = U2 @ torch.diag_embed(1.0 / torch.sqrt(S2)) @ V2.T
+    
     # Compute T = C11^(-1/2) * C12 * C22^(-1/2)
-    # The trace of T equals the sum of canonical correlations
-    try:
-        # Use Cholesky decomposition for numerical stability
-        # C11 = L11 * L11^T, so C11^(-1/2) = L11^(-T)
-        L11 = torch.linalg.cholesky(C11)
-        L22 = torch.linalg.cholesky(C22)
-        
-        # Solve: L11 * X = C12  =>  X = L11^(-1) * C12
-        X = torch.linalg.solve_triangular(L11, C12, upper=False)
-        # Solve: L22^T * T = X^T  =>  T = (L22^(-T) * X^T)^T = X * L22^(-1)
-        T = torch.linalg.solve_triangular(L22, X.T, upper=True).T
-        
-    except RuntimeError:
-        # Fallback to SVD-based approach if Cholesky fails (shouldn't happen with regularization)
-        # C11^(-1/2) = U1 * diag(1/sqrt(S1)) * V1^T
-        U1, S1, V1 = torch.linalg.svd(C11)
-        U2, S2, V2 = torch.linalg.svd(C22)
-        
-        # Add small epsilon to prevent division by zero
-        eps = 1e-8
-        C11_inv_sqrt = U1 @ torch.diag_embed(1.0 / torch.sqrt(S1 + eps)) @ V1.T
-        C22_inv_sqrt = U2 @ torch.diag_embed(1.0 / torch.sqrt(S2 + eps)) @ V2.T
-        
-        T = C11_inv_sqrt @ C12 @ C22_inv_sqrt
+    T = C11_inv_sqrt @ C12 @ C22_inv_sqrt
     
     # Compute the loss: maximize trace(T) = sum of canonical correlations
     if use_all_singular_values:
@@ -137,8 +146,9 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-4, r2=1e-4, us
         singular_values = torch.linalg.svdvals(T)
         correlation = torch.sum(singular_values[:min(latent_dim, batch_size)])
     
-    # Return negative correlation (to maximize via minimization)
-    return -correlation
+    # Return negative correlation scaled by 1/latent_dim to normalize the loss magnitude
+    # This ensures the loss is on a similar scale regardless of latent dimension
+    return -correlation / latent_dim
 
 def acquire_pairs(X, Y, k=30, metric='angular'):
     # This function was modified from iMAP: https://github.com/Svvord/iMAP/blob/master/imap/stage2.py
