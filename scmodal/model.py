@@ -15,6 +15,7 @@ class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
                  lambdaGAN = 1.0, lambdaDCCA = 5.0, n_KNN = 30, use_dcca=False,
+                 dcca_r1=1e-4, dcca_r2=1e-4, dcca_use_all_singular_values=True,
                  model_path="models", data_path="data", result_path="results"):
 
         # add device
@@ -38,6 +39,9 @@ class Model(object):
         self.lambdaDCCA = lambdaDCCA
         self.n_KNN = n_KNN
         self.use_dcca = use_dcca  # Flag to enable/disable DCCA
+        self.dcca_r1 = dcca_r1  # DCCA regularization parameter for modality 1
+        self.dcca_r2 = dcca_r2  # DCCA regularization parameter for modality 2
+        self.dcca_use_all_singular_values = dcca_use_all_singular_values  # Use all singular values in DCCA loss
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -128,9 +132,10 @@ class Model(object):
             z_B_encoder = self.E_B(x_B)
             
             # Step 2: Pass through Deep CCA to get correlated representations
+            # DCCA transforms encoder outputs to maximize canonical correlations
             if self.use_dcca:
                 z_A_dcca, z_B_dcca = self.dcca(z_A_encoder, z_B_encoder)
-                # Use DCCA representations for the rest of the pipeline
+                # Use DCCA representations for generation, MNN loss, and other downstream tasks
                 z_A = z_A_dcca
                 z_B = z_B_dcca
             else:
@@ -150,10 +155,17 @@ class Model(object):
             z_AtoB_encoder = self.E_B(x_AtoB)
             z_BtoA_encoder = self.E_A(x_BtoA)
             
-            # Step 6: Pass encoded cross-modal data through DCCA
+            # Step 6: Pass encoded cross-modal data through DCCA (if enabled)
+            # For latent alignment: z_A should align with DCCA(z_AtoB_encoder, z_B_encoder)
+            # and z_B should align with DCCA(z_A_encoder, z_BtoA_encoder)
             if self.use_dcca:
-                z_AtoB_dcca, _ = self.dcca(z_AtoB_encoder, z_B_encoder)  # Use B as second input for consistency
-                _, z_BtoA_dcca = self.dcca(z_A_encoder, z_BtoA_encoder)  # Use A as first input for consistency
+                # Compute DCCA for cross-modal generated data
+                # z_AtoB_dcca is the DCCA representation when we encode generated B from A
+                # We pair it with z_B_encoder to get the DCCA transformation
+                z_AtoB_dcca, _ = self.dcca(z_AtoB_encoder, z_B_encoder)
+                # z_BtoA_dcca is the DCCA representation when we encode generated A from B  
+                # We pair it with z_A_encoder to get the DCCA transformation
+                _, z_BtoA_dcca = self.dcca(z_A_encoder, z_BtoA_encoder)
                 
                 # Use DCCA representations for latent alignment
                 z_AtoB = z_AtoB_dcca
@@ -185,7 +197,9 @@ class Model(object):
             loss_AE_B = torch.mean((x_Brecon - x_B)**2)
             loss_AE = loss_AE_A + loss_AE_B
 
-            # latent align loss: NOW USING DCCA REPRESENTATIONS
+            # latent align loss: Uses DCCA representations
+            # z_A (DCCA of original A) should align with z_AtoB (DCCA of encoded generated B from A)
+            # z_B (DCCA of original B) should align with z_BtoA (DCCA of encoded generated A from B)
             loss_LA_AtoB = torch.mean((z_A - z_AtoB)**2)
             loss_LA_BtoA = torch.mean((z_B - z_BtoA)**2)
             loss_LA = loss_LA_AtoB + loss_LA_BtoA
@@ -197,6 +211,7 @@ class Model(object):
             loss_Geo = - (torch.clamp(cos(K_A, K_A_z), max=0.975).mean() + torch.clamp(cos(K_B, K_B_z), max=0.975).mean())
 
             # MNN loss (using DCCA representations)
+            # Computes distance between DCCA representations of matched nearest neighbors
             Sim = acquire_pairs(self.emb_A[index_A, :self.shared_gene_num], self.emb_B[index_B, :self.shared_gene_num], k=self.n_KNN)
             Sim = torch.from_numpy(Sim).float().to(self.device)
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
@@ -205,7 +220,9 @@ class Model(object):
             # DCCA correlation loss (if enabled)
             loss_DCCA = 0
             if self.use_dcca:
-                loss_DCCA = deep_cca_loss(z_A_encoder, z_B_encoder, z_A_dcca, z_B_dcca)
+                loss_DCCA = deep_cca_loss(z_A_encoder, z_B_encoder, z_A_dcca, z_B_dcca,
+                                         r1=self.dcca_r1, r2=self.dcca_r2,
+                                         use_all_singular_values=self.dcca_use_all_singular_values)
 
             optimizer_G.zero_grad()
             
