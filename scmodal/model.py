@@ -505,151 +505,151 @@ class Model(object):
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
 
     def eval(self):
-    begin_time = time.time()
-    print("Beginning time: ", time.asctime(time.localtime(begin_time)))
-
-    self.E_A = encoder(self.emb_A.shape[1], self.n_latent, 
-                      use_gat=self.use_gat, 
-                      gat_hidden=self.gat_hidden,
-                      gat_heads=self.gat_heads,
-                      dropout=self.gat_dropout).to(self.device)
-    self.E_B = encoder(self.emb_B.shape[1], self.n_latent,
-                      use_gat=self.use_gat,
-                      gat_hidden=self.gat_hidden,
-                      gat_heads=self.gat_heads,
-                      dropout=self.gat_dropout).to(self.device)
-    self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
-    self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
+        begin_time = time.time()
+        print("Beginning time: ", time.asctime(time.localtime(begin_time)))
     
-    # Load Deep CCA if it was used during training
-    checkpoint = torch.load(os.path.join(self.model_path, "ckpt.pth"))
-    self.E_A.load_state_dict(checkpoint['E_A'])
-    self.E_B.load_state_dict(checkpoint['E_B'])
-    self.G_A.load_state_dict(checkpoint['G_A'])
-    self.G_B.load_state_dict(checkpoint['G_B'])
-    
-    if self.use_deep_cca and 'deep_cca' in checkpoint:
-        self.deep_cca = DeepCCA(
-            latent_dim=self.n_latent,
-            cca_dim=self.cca_dim,
-            hidden_dims=self.cca_hidden_dims
-        ).to(self.device)
-        self.deep_cca.load_state_dict(checkpoint['deep_cca'])
-        print("Deep CCA loaded from checkpoint")
-
-    # Clear GPU cache before processing
-    torch.cuda.empty_cache()
-    
-    # Process in batches to avoid memory issues
-    batch_size = 512  # Adjust based on your GPU memory
-    z_A_batches = []
-    z_B_batches = []
-    x_AtoB_batches = []
-    x_BtoA_batches = []
-    
-    print(f"Processing evaluation in batches of {batch_size}...")
-    
-    with torch.no_grad():
-        # Process modality A in batches
-        for i in range(0, len(self.emb_A), batch_size):
-            end_idx = min(i + batch_size, len(self.emb_A))
-            x_A_batch = torch.from_numpy(self.emb_A[i:end_idx]).float().to(self.device)
-            
-            if self.use_gat:
-                adj_A = self._get_gat_adjacency_batch(x_A_batch, k=self.gat_knn)
-                z_A_batch = self.E_A(x_A_batch, adj_A)
-            else:
-                z_A_batch = self.E_A(x_A_batch)
-            
-            z_A_batches.append(z_A_batch.cpu())
-            
-            # Generate cross-modality translation for this batch
-            x_AtoB_batch = self.G_B(z_A_batch)
-            x_AtoB_batches.append(x_AtoB_batch.cpu())
-            
-            # Free GPU memory for this batch
-            del x_A_batch, z_A_batch, x_AtoB_batch
-            if self.use_gat:
-                del adj_A
-            torch.cuda.empty_cache()
+        self.E_A = encoder(self.emb_A.shape[1], self.n_latent, 
+                          use_gat=self.use_gat, 
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
+        self.E_B = encoder(self.emb_B.shape[1], self.n_latent,
+                          use_gat=self.use_gat,
+                          gat_hidden=self.gat_hidden,
+                          gat_heads=self.gat_heads,
+                          dropout=self.gat_dropout).to(self.device)
+        self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
+        self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         
-        # Process modality B in batches  
-        for i in range(0, len(self.emb_B), batch_size):
-            end_idx = min(i + batch_size, len(self.emb_B))
-            x_B_batch = torch.from_numpy(self.emb_B[i:end_idx]).float().to(self.device)
-            
-            if self.use_gat:
-                adj_B = self._get_gat_adjacency_batch(x_B_batch, k=self.gat_knn)
-                z_B_batch = self.E_B(x_B_batch, adj_B)
-            else:
-                z_B_batch = self.E_B(x_B_batch)
-            
-            z_B_batches.append(z_B_batch.cpu())
-            
-            # Generate cross-modality translation for this batch
-            x_BtoA_batch = self.G_A(z_B_batch)
-            x_BtoA_batches.append(x_BtoA_batch.cpu())
-            
-            # Free GPU memory for this batch
-            del x_B_batch, z_B_batch, x_BtoA_batch
-            if self.use_gat:
-                del adj_B
-            torch.cuda.empty_cache()
-    
-    # Concatenate all batches back to full datasets
-    z_A = torch.cat(z_A_batches, dim=0).to(self.device)
-    z_B = torch.cat(z_B_batches, dim=0).to(self.device)
-    x_AtoB = torch.cat(x_AtoB_batches, dim=0).to(self.device)
-    x_BtoA = torch.cat(x_BtoA_batches, dim=0).to(self.device)
-    
-    # Apply Deep CCA alignment during evaluation if available
-    # Note: We apply this after batch processing to avoid memory issues
-    if self.use_deep_cca and hasattr(self, 'deep_cca'):
-        print("Applying Deep CCA alignment...")
-        # Apply Deep CCA in batches if needed due to memory constraints
-        z_A_aligned_batches = []
-        z_B_aligned_batches = []
+        # Load Deep CCA if it was used during training
+        checkpoint = torch.load(os.path.join(self.model_path, "ckpt.pth"))
+        self.E_A.load_state_dict(checkpoint['E_A'])
+        self.E_B.load_state_dict(checkpoint['E_B'])
+        self.G_A.load_state_dict(checkpoint['G_A'])
+        self.G_B.load_state_dict(checkpoint['G_B'])
         
-        for i in range(0, len(z_A), batch_size):
-            end_idx_A = min(i + batch_size, len(z_A))
-            end_idx_B = min(i + batch_size, len(z_B))
-            
-            z_A_batch = z_A[i:end_idx_A]
-            z_B_batch = z_B[i:end_idx_B]
-            
-            # Ensure both batches have the same size for Deep CCA
-            min_batch_size = min(len(z_A_batch), len(z_B_batch))
-            if min_batch_size > 0:
-                z_A_batch = z_A_batch[:min_batch_size]
-                z_B_batch = z_B_batch[:min_batch_size]
+        if self.use_deep_cca and 'deep_cca' in checkpoint:
+            self.deep_cca = DeepCCA(
+                latent_dim=self.n_latent,
+                cca_dim=self.cca_dim,
+                hidden_dims=self.cca_hidden_dims
+            ).to(self.device)
+            self.deep_cca.load_state_dict(checkpoint['deep_cca'])
+            print("Deep CCA loaded from checkpoint")
+    
+        # Clear GPU cache before processing
+        torch.cuda.empty_cache()
+        
+        # Process in batches to avoid memory issues
+        batch_size = 512  # Adjust based on your GPU memory
+        z_A_batches = []
+        z_B_batches = []
+        x_AtoB_batches = []
+        x_BtoA_batches = []
+        
+        print(f"Processing evaluation in batches of {batch_size}...")
+        
+        with torch.no_grad():
+            # Process modality A in batches
+            for i in range(0, len(self.emb_A), batch_size):
+                end_idx = min(i + batch_size, len(self.emb_A))
+                x_A_batch = torch.from_numpy(self.emb_A[i:end_idx]).float().to(self.device)
                 
-                z_A_aligned, z_B_aligned, _ = self._apply_deep_cca_alignment(z_A_batch, z_B_batch)
-                z_A_aligned_batches.append(z_A_aligned.cpu())
-                z_B_aligned_batches.append(z_B_aligned.cpu())
+                if self.use_gat:
+                    adj_A = self._get_gat_adjacency_batch(x_A_batch, k=self.gat_knn)
+                    z_A_batch = self.E_A(x_A_batch, adj_A)
+                else:
+                    z_A_batch = self.E_A(x_A_batch)
+                
+                z_A_batches.append(z_A_batch.cpu())
+                
+                # Generate cross-modality translation for this batch
+                x_AtoB_batch = self.G_B(z_A_batch)
+                x_AtoB_batches.append(x_AtoB_batch.cpu())
+                
+                # Free GPU memory for this batch
+                del x_A_batch, z_A_batch, x_AtoB_batch
+                if self.use_gat:
+                    del adj_A
+                torch.cuda.empty_cache()
             
-            del z_A_batch, z_B_batch
-            torch.cuda.empty_cache()
+            # Process modality B in batches  
+            for i in range(0, len(self.emb_B), batch_size):
+                end_idx = min(i + batch_size, len(self.emb_B))
+                x_B_batch = torch.from_numpy(self.emb_B[i:end_idx]).float().to(self.device)
+                
+                if self.use_gat:
+                    adj_B = self._get_gat_adjacency_batch(x_B_batch, k=self.gat_knn)
+                    z_B_batch = self.E_B(x_B_batch, adj_B)
+                else:
+                    z_B_batch = self.E_B(x_B_batch)
+                
+                z_B_batches.append(z_B_batch.cpu())
+                
+                # Generate cross-modality translation for this batch
+                x_BtoA_batch = self.G_A(z_B_batch)
+                x_BtoA_batches.append(x_BtoA_batch.cpu())
+                
+                # Free GPU memory for this batch
+                del x_B_batch, z_B_batch, x_BtoA_batch
+                if self.use_gat:
+                    del adj_B
+                torch.cuda.empty_cache()
         
-        # Replace with aligned representations if we have any
-        if z_A_aligned_batches and z_B_aligned_batches:
-            z_A = torch.cat(z_A_aligned_batches, dim=0).to(self.device)
-            z_B = torch.cat(z_B_aligned_batches, dim=0).to(self.device)
-            print("Deep CCA alignment applied successfully")
+        # Concatenate all batches back to full datasets
+        z_A = torch.cat(z_A_batches, dim=0).to(self.device)
+        z_B = torch.cat(z_B_batches, dim=0).to(self.device)
+        x_AtoB = torch.cat(x_AtoB_batches, dim=0).to(self.device)
+        x_BtoA = torch.cat(x_BtoA_batches, dim=0).to(self.device)
+        
+        # Apply Deep CCA alignment during evaluation if available
+        # Note: We apply this after batch processing to avoid memory issues
+        if self.use_deep_cca and hasattr(self, 'deep_cca'):
+            print("Applying Deep CCA alignment...")
+            # Apply Deep CCA in batches if needed due to memory constraints
+            z_A_aligned_batches = []
+            z_B_aligned_batches = []
+            
+            for i in range(0, len(z_A), batch_size):
+                end_idx_A = min(i + batch_size, len(z_A))
+                end_idx_B = min(i + batch_size, len(z_B))
+                
+                z_A_batch = z_A[i:end_idx_A]
+                z_B_batch = z_B[i:end_idx_B]
+                
+                # Ensure both batches have the same size for Deep CCA
+                min_batch_size = min(len(z_A_batch), len(z_B_batch))
+                if min_batch_size > 0:
+                    z_A_batch = z_A_batch[:min_batch_size]
+                    z_B_batch = z_B_batch[:min_batch_size]
+                    
+                    z_A_aligned, z_B_aligned, _ = self._apply_deep_cca_alignment(z_A_batch, z_B_batch)
+                    z_A_aligned_batches.append(z_A_aligned.cpu())
+                    z_B_aligned_batches.append(z_B_aligned.cpu())
+                
+                del z_A_batch, z_B_batch
+                torch.cuda.empty_cache()
+            
+            # Replace with aligned representations if we have any
+            if z_A_aligned_batches and z_B_aligned_batches:
+                z_A = torch.cat(z_A_aligned_batches, dim=0).to(self.device)
+                z_B = torch.cat(z_B_aligned_batches, dim=0).to(self.device)
+                print("Deep CCA alignment applied successfully")
+        
+        end_time = time.time()
+        
+        print("Ending time: ", time.asctime(time.localtime(end_time)))
+        self.eval_time = end_time - begin_time
+        print("Evaluating takes %.2f seconds" % self.eval_time)
     
-    end_time = time.time()
-    
-    print("Ending time: ", time.asctime(time.localtime(end_time)))
-    self.eval_time = end_time - begin_time
-    print("Evaluating takes %.2f seconds" % self.eval_time)
-
-    # Convert to numpy for final storage
-    self.latent = np.concatenate((z_A.detach().cpu().numpy(), z_B.detach().cpu().numpy()), axis=0)
-    self.data_Aspace = np.concatenate((self.emb_A, x_BtoA.detach().cpu().numpy()), axis=0)
-    self.data_Bspace = np.concatenate((x_AtoB.detach().cpu().numpy(), self.emb_B), axis=0)
-    
-    # Final cleanup
-    del z_A, z_B, x_AtoB, x_BtoA
-    torch.cuda.empty_cache()
+        # Convert to numpy for final storage
+        self.latent = np.concatenate((z_A.detach().cpu().numpy(), z_B.detach().cpu().numpy()), axis=0)
+        self.data_Aspace = np.concatenate((self.emb_A, x_BtoA.detach().cpu().numpy()), axis=0)
+        self.data_Bspace = np.concatenate((x_AtoB.detach().cpu().numpy(), self.emb_B), axis=0)
+        
+        # Final cleanup
+        del z_A, z_B, x_AtoB, x_BtoA
+        torch.cuda.empty_cache()
 
     def get_imputed_df(self, 
                        scale = 'scaled' # if scale=='log', then restore expression after log1p
