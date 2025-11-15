@@ -17,6 +17,7 @@ class Model(object):
                  lambdaGAN = 1.0, lambdaDCCA = 0.01, n_KNN = 30, use_dcca=False,
                  dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=False,
                  dcca_latent_dim=8, dcca_hidden_dims=(64, 32),
+                 dcca_start_fraction=0.1, dcca_ramp_fraction=0.3, dcca_blend=0.3,
                  model_path="models", data_path="data", result_path="results"):
 
         # add device
@@ -45,6 +46,11 @@ class Model(object):
         self.dcca_use_all_singular_values = dcca_use_all_singular_values  # Use all singular values in DCCA loss
         self.dcca_latent_dim = min(dcca_latent_dim, self.n_latent)
         self.dcca_hidden_dims = list(dcca_hidden_dims)
+        self.dcca_start_fraction = max(0.0, min(dcca_start_fraction, 1.0))
+        self.dcca_ramp_fraction = max(0.0, dcca_ramp_fraction)
+        if self.dcca_start_fraction + self.dcca_ramp_fraction > 1.0:
+            self.dcca_ramp_fraction = max(0.0, 1.0 - self.dcca_start_fraction)
+        self.dcca_blend = float(np.clip(dcca_blend, 0.0, 1.0))
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -131,7 +137,17 @@ class Model(object):
         N_B = self.emb_B.shape[0]
         
         for step in range(self.training_steps):
-            current_lambda_dcca = self.lambdaDCCA if self.use_dcca else 0.0
+            if self.use_dcca:
+                progress = step / max(1, self.training_steps - 1)
+                if progress < self.dcca_start_fraction:
+                    current_lambda_dcca = 0.0
+                elif progress < self.dcca_start_fraction + max(self.dcca_ramp_fraction, 1e-6):
+                    ramp_progress = (progress - self.dcca_start_fraction) / max(self.dcca_ramp_fraction, 1e-6)
+                    current_lambda_dcca = self.lambdaDCCA * np.clip(ramp_progress, 0.0, 1.0)
+                else:
+                    current_lambda_dcca = self.lambdaDCCA
+            else:
+                current_lambda_dcca = 0.0
             
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
@@ -162,6 +178,13 @@ class Model(object):
                     r2=self.dcca_r2,
                     use_all_singular_values=self.dcca_use_all_singular_values,
                 )
+
+                if self.dcca_blend > 0.0:
+                    blend = self.dcca_blend
+                    z_A = z_A.clone()
+                    z_B = z_B.clone()
+                    z_A[:, :self.dcca_latent_dim] = (1 - blend) * z_A_shared + blend * z_A_dcca
+                    z_B[:, :self.dcca_latent_dim] = (1 - blend) * z_B_shared + blend * z_B_dcca
             else:
                 loss_DCCA = torch.tensor(0.0, device=self.device)
             
@@ -265,6 +288,16 @@ class Model(object):
         
         if self.use_dcca:
             state['dcca'] = self.dcca.state_dict()
+            state['dcca_config'] = {
+                'latent_dim': self.dcca_latent_dim,
+                'hidden_dims': self.dcca_hidden_dims,
+                'use_batch_norm': self.dcca.use_batch_norm,
+                'dropout': self.dcca.dropout,
+                'lambda': self.lambdaDCCA,
+                'start_fraction': self.dcca_start_fraction,
+                'ramp_fraction': self.dcca_ramp_fraction,
+                'blend': self.dcca_blend,
+            }
 
         torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
 
@@ -285,8 +318,32 @@ class Model(object):
         self.G_B.load_state_dict(checkpoint['G_B'])
         
         # Load DCCA if it exists in checkpoint
+        self.dcca = None
         if self.use_dcca and 'dcca' in checkpoint:
-            self.dcca = DeepCCA(self.n_latent, self.n_latent, self.n_latent).to(self.device)
+            dcca_cfg = checkpoint.get('dcca_config', {})
+            cfg_latent_dim = dcca_cfg.get('latent_dim', self.dcca_latent_dim)
+            cfg_hidden_dims = dcca_cfg.get('hidden_dims', self.dcca_hidden_dims)
+            cfg_use_bn = dcca_cfg.get('use_batch_norm', False)
+            cfg_dropout = dcca_cfg.get('dropout', 0.0)
+            self.lambdaDCCA = dcca_cfg.get('lambda', self.lambdaDCCA)
+            self.dcca_start_fraction = dcca_cfg.get('start_fraction', self.dcca_start_fraction)
+            self.dcca_ramp_fraction = dcca_cfg.get('ramp_fraction', self.dcca_ramp_fraction)
+            self.dcca_blend = dcca_cfg.get('blend', self.dcca_blend)
+            self.dcca_start_fraction = float(np.clip(self.dcca_start_fraction, 0.0, 1.0))
+            self.dcca_ramp_fraction = max(0.0, self.dcca_ramp_fraction)
+            if self.dcca_start_fraction + self.dcca_ramp_fraction > 1.0:
+                self.dcca_ramp_fraction = max(0.0, 1.0 - self.dcca_start_fraction)
+            self.dcca_blend = float(np.clip(self.dcca_blend, 0.0, 1.0))
+            self.dcca_latent_dim = min(cfg_latent_dim, self.n_latent)
+            self.dcca_hidden_dims = list(cfg_hidden_dims)
+            self.dcca = DeepCCA(
+                input_dim1=self.dcca_latent_dim,
+                input_dim2=self.dcca_latent_dim,
+                latent_dim=self.dcca_latent_dim,
+                hidden_dims=self.dcca_hidden_dims,
+                use_batch_norm=cfg_use_bn,
+                dropout=cfg_dropout,
+            ).to(self.device)
             self.dcca.load_state_dict(checkpoint['dcca'])
             self.dcca.eval()  # Set DCCA to eval mode for inference
 
@@ -302,11 +359,17 @@ class Model(object):
             z_A_encoder = self.E_A(x_A)
             z_B_encoder = self.E_B(x_B)
             
-            # Pass through DCCA if enabled (DCCA is applied after encoder)
-            if self.use_dcca and hasattr(self, 'dcca'):
-                z_A, z_B = self.dcca(z_A_encoder, z_B_encoder)
-            else:
-                z_A, z_B = z_A_encoder, z_B_encoder
+            # Keep encoder latent space for downstream tasks (DCCA is
+            # an auxiliary regularizer and does not replace the latent)
+            z_A = z_A_encoder
+            z_B = z_B_encoder
+
+            # Optionally compute correlated subspace for analysis
+            if self.use_dcca and self.dcca is not None:
+                _ = self.dcca(
+                    z_A[:, :self.dcca_latent_dim],
+                    z_B[:, :self.dcca_latent_dim],
+                )
 
             x_AtoB = self.G_B(z_A)
             x_BtoA = self.G_A(z_B)
