@@ -84,8 +84,9 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-5, r2=1e-5, us
     - Andrew et al. "Deep Canonical Correlation Analysis", ICML 2013
     - Reference: https://github.com/VahidooX/DeepCCA
     
-    The loss maximizes the trace of T = C11^(-1/2) * C12 * C22^(-1/2),
-    which equals the sum of canonical correlations.
+    The loss maximizes the sum of singular values of T = C11^(-1/2) * C12 * C22^(-1/2),
+    which equals the sum of canonical correlations. Note: canonical correlations are the
+    singular values of T, NOT the diagonal elements (trace).
     
     Args:
         z1_encoder: Encoder output for modality 1 (not used in loss, kept for API compatibility)
@@ -97,7 +98,7 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-5, r2=1e-5, us
         use_all_singular_values: If True, use all singular values; if False, use only top-k
     
     Returns:
-        Negative trace scaled by 1/latent_dim (to maximize correlation via minimization)
+        Negative sum of singular values scaled by 1/latent_dim (to maximize correlation via minimization)
         The scaling ensures the loss magnitude is comparable to other losses.
     """
     batch_size, latent_dim = z1_dcca.shape
@@ -136,14 +137,17 @@ def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-5, r2=1e-5, us
     # Compute T = C11^(-1/2) * C12 * C22^(-1/2)
     T = C11_inv_sqrt @ C12 @ C22_inv_sqrt
     
-    # Compute the loss: maximize trace(T) = sum of canonical correlations
+    # Compute the loss: maximize sum of canonical correlations
+    # CRITICAL: Canonical correlations are the SINGULAR VALUES of T, not the diagonal elements
+    # The trace only equals the sum of singular values if T is diagonal (which it's not in general)
+    singular_values = torch.linalg.svdvals(T)
+    
     if use_all_singular_values:
-        # Use trace (sum of all canonical correlations)
-        correlation = torch.trace(T)
+        # Use sum of all singular values (all canonical correlations)
+        correlation = torch.sum(singular_values)
     else:
         # Use only top-k singular values (more stable for high dimensions)
         # This is equivalent to using only the top-k canonical correlations
-        singular_values = torch.linalg.svdvals(T)
         correlation = torch.sum(singular_values[:min(latent_dim, batch_size)])
     
     # Return negative correlation scaled by 1/latent_dim to normalize the loss magnitude
