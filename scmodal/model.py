@@ -14,9 +14,9 @@ from scmodal.utils import *
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
-                 lambdaGAN = 1.0, lambdaDCCA = 0.05, n_KNN = 30, use_dcca=False,
+                 lambdaGAN = 1.0,                  lambdaDCCA = 0.02, n_KNN = 30, use_dcca=False,
                  dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=False,
-                 dcca_warmup_steps=1000, model_path="models", data_path="data", result_path="results"):
+                 dcca_warmup_steps=None, model_path="models", data_path="data", result_path="results"):
 
         # add device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -42,7 +42,11 @@ class Model(object):
         self.dcca_r1 = dcca_r1  # DCCA regularization parameter for modality 1
         self.dcca_r2 = dcca_r2  # DCCA regularization parameter for modality 2
         self.dcca_use_all_singular_values = dcca_use_all_singular_values  # Use all singular values in DCCA loss
-        self.dcca_warmup_steps = dcca_warmup_steps  # Steps to train DCCA before freezing
+        # Set warmup to 20% of training steps if not specified, but at least 500 steps
+        if dcca_warmup_steps is None:
+            self.dcca_warmup_steps = max(500, int(0.2 * training_steps))
+        else:
+            self.dcca_warmup_steps = min(dcca_warmup_steps, training_steps)  # Don't exceed training steps
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -125,11 +129,26 @@ class Model(object):
         dcca_frozen = False
 
         for step in range(self.training_steps):
-            # Freeze DCCA after warmup to prevent it from dominating other losses
-            if self.use_dcca and step == self.dcca_warmup_steps and not dcca_frozen:
-                self.dcca.freeze()
-                dcca_frozen = True
-                print(f"🔒 DCCA frozen at step {step} to allow other losses to recover")
+            # Schedule DCCA weight: decay to near zero after warmup
+            # This allows DCCA to learn correlations initially, then fade out
+            if self.use_dcca:
+                if step < self.dcca_warmup_steps:
+                    # During warmup, use full lambdaDCCA
+                    current_lambda_dcca = self.lambdaDCCA
+                else:
+                    # After warmup, decay exponentially to 0.001
+                    decay_steps = step - self.dcca_warmup_steps
+                    decay_rate = 0.95  # Decay by 5% per 200 steps
+                    decay_factor = decay_rate ** (decay_steps / 200)
+                    current_lambda_dcca = max(0.001, self.lambdaDCCA * decay_factor)
+                
+                # Freeze DCCA parameters after warmup to stabilize
+                if step == self.dcca_warmup_steps and not dcca_frozen:
+                    self.dcca.freeze()
+                    dcca_frozen = True
+                    print(f"🔒 DCCA frozen at step {step}, lambda_DCCA will decay from {self.lambdaDCCA:.4f}")
+            else:
+                current_lambda_dcca = 0
             
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
@@ -236,7 +255,7 @@ class Model(object):
 
             optimizer_G.zero_grad()
             
-            # Combine all losses
+            # Combine all losses with scheduled DCCA weight
             loss_G = (self.lambdaGAN * loss_G_GAN + 
                      self.lambdaAE * loss_AE + 
                      self.lambdaLA * loss_LA + 
@@ -244,7 +263,7 @@ class Model(object):
                      self.lambdaGeo * loss_Geo)
             
             if self.use_dcca:
-                loss_G += self.lambdaDCCA * loss_DCCA
+                loss_G += current_lambda_dcca * loss_DCCA
             
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
@@ -256,7 +275,7 @@ class Model(object):
                     self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN)
                 
                 if self.use_dcca:
-                    log_message += ", loss_DCCA=%f" % (self.lambdaDCCA * loss_DCCA)
+                    log_message += ", loss_DCCA=%f (lambda=%.4f)" % (current_lambda_dcca * loss_DCCA, current_lambda_dcca)
                 
                 print(log_message)
 
@@ -296,22 +315,28 @@ class Model(object):
         if self.use_dcca and 'dcca' in checkpoint:
             self.dcca = DeepCCA(self.n_latent, self.n_latent, self.n_latent).to(self.device)
             self.dcca.load_state_dict(checkpoint['dcca'])
+            self.dcca.eval()  # Set DCCA to eval mode for inference
 
         x_A = torch.from_numpy(self.emb_A).float().to(self.device)
         x_B = torch.from_numpy(self.emb_B).float().to(self.device)
 
-        # Get encoder representations
-        z_A_encoder = self.E_A(x_A)
-        z_B_encoder = self.E_B(x_B)
+        # Set models to eval mode
+        self.E_A.eval()
+        self.E_B.eval()
         
-        # Pass through DCCA if enabled
-        if self.use_dcca and hasattr(self, 'dcca'):
-            z_A, z_B = self.dcca(z_A_encoder, z_B_encoder)
-        else:
-            z_A, z_B = z_A_encoder, z_B_encoder
+        with torch.no_grad():  # No gradients needed for inference
+            # Get encoder representations
+            z_A_encoder = self.E_A(x_A)
+            z_B_encoder = self.E_B(x_B)
+            
+            # Pass through DCCA if enabled (DCCA is applied after encoder)
+            if self.use_dcca and hasattr(self, 'dcca'):
+                z_A, z_B = self.dcca(z_A_encoder, z_B_encoder)
+            else:
+                z_A, z_B = z_A_encoder, z_B_encoder
 
-        x_AtoB = self.G_B(z_A)
-        x_BtoA = self.G_A(z_B)
+            x_AtoB = self.G_B(z_A)
+            x_BtoA = self.G_A(z_B)
 
         end_time = time.time()
         
@@ -319,6 +344,7 @@ class Model(object):
         self.eval_time = end_time - begin_time
         print("Evaluating takes %.2f seconds" % self.eval_time)
 
+        # Save DCCA-transformed latent space (or encoder space if DCCA disabled)
         self.latent = np.concatenate((z_A.detach().cpu().numpy(), z_B.detach().cpu().numpy()), axis=0)
         self.data_Aspace = np.concatenate((self.emb_A, x_BtoA.detach().cpu().numpy()), axis=0)
         self.data_Bspace = np.concatenate((x_AtoB.detach().cpu().numpy(), self.emb_B), axis=0)
