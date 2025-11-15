@@ -14,9 +14,10 @@ from scmodal.utils import *
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
-                 lambdaGAN = 1.0,                  lambdaDCCA = 0.02, n_KNN = 30, use_dcca=False,
+                 lambdaGAN = 1.0, lambdaDCCA = 0.01, n_KNN = 30, use_dcca=False,
                  dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=False,
-                 dcca_warmup_steps=None, model_path="models", data_path="data", result_path="results"):
+                 dcca_latent_dim=8, dcca_hidden_dims=(64, 32),
+                 model_path="models", data_path="data", result_path="results"):
 
         # add device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -42,11 +43,8 @@ class Model(object):
         self.dcca_r1 = dcca_r1  # DCCA regularization parameter for modality 1
         self.dcca_r2 = dcca_r2  # DCCA regularization parameter for modality 2
         self.dcca_use_all_singular_values = dcca_use_all_singular_values  # Use all singular values in DCCA loss
-        # Set warmup to 20% of training steps if not specified, but at least 500 steps
-        if dcca_warmup_steps is None:
-            self.dcca_warmup_steps = max(500, int(0.2 * training_steps))
-        else:
-            self.dcca_warmup_steps = min(dcca_warmup_steps, training_steps)  # Don't exceed training steps
+        self.dcca_latent_dim = min(dcca_latent_dim, self.n_latent)
+        self.dcca_hidden_dims = list(dcca_hidden_dims)
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -102,9 +100,16 @@ class Model(object):
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.D_Z = discriminator(self.n_latent).to(self.device)
         
-        # Initialize Deep CCA if enabled
+        # Initialize Deep CCA if enabled (auxiliary regularizer on shared latent dimensions)
         if self.use_dcca:
-            self.dcca = DeepCCA(self.n_latent, self.n_latent, self.n_latent).to(self.device)
+            self.dcca = DeepCCA(
+                input_dim1=self.dcca_latent_dim,
+                input_dim2=self.dcca_latent_dim,
+                latent_dim=self.dcca_latent_dim,
+                hidden_dims=self.dcca_hidden_dims,
+                use_batch_norm=False,
+                dropout=0.0,
+            ).to(self.device)
             params_dcca = list(self.dcca.parameters())
         else:
             params_dcca = []
@@ -125,30 +130,8 @@ class Model(object):
         N_A = self.emb_A.shape[0]
         N_B = self.emb_B.shape[0]
         
-        # Track if DCCA has been frozen
-        dcca_frozen = False
-
         for step in range(self.training_steps):
-            # Schedule DCCA weight: decay to near zero after warmup
-            # This allows DCCA to learn correlations initially, then fade out
-            if self.use_dcca:
-                if step < self.dcca_warmup_steps:
-                    # During warmup, use full lambdaDCCA
-                    current_lambda_dcca = self.lambdaDCCA
-                else:
-                    # After warmup, decay exponentially to 0.001
-                    decay_steps = step - self.dcca_warmup_steps
-                    decay_rate = 0.95  # Decay by 5% per 200 steps
-                    decay_factor = decay_rate ** (decay_steps / 200)
-                    current_lambda_dcca = max(0.001, self.lambdaDCCA * decay_factor)
-                
-                # Freeze DCCA parameters after warmup to stabilize
-                if step == self.dcca_warmup_steps and not dcca_frozen:
-                    self.dcca.freeze()
-                    dcca_frozen = True
-                    print(f"🔒 DCCA frozen at step {step}, lambda_DCCA will decay from {self.lambdaDCCA:.4f}")
-            else:
-                current_lambda_dcca = 0
+            current_lambda_dcca = self.lambdaDCCA if self.use_dcca else 0.0
             
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
@@ -160,19 +143,29 @@ class Model(object):
             z_A_encoder = self.E_A(x_A)
             z_B_encoder = self.E_B(x_B)
             
-            # Step 2: Pass through Deep CCA to get correlated representations
-            # DCCA transforms encoder outputs to maximize canonical correlations
-            if self.use_dcca:
-                z_A_dcca, z_B_dcca = self.dcca(z_A_encoder, z_B_encoder)
-                # Use DCCA representations for generation, MNN loss, and other downstream tasks
-                z_A = z_A_dcca
-                z_B = z_B_dcca
-            else:
-                # Use encoder representations directly if DCCA is disabled
-                z_A = z_A_encoder
-                z_B = z_B_encoder
+            # Step 2: Use encoder representations as primary latent variables
+            z_A = z_A_encoder
+            z_B = z_B_encoder
             
-            # Step 3: Generate cross-modal data using DCCA representations
+            # Auxiliary DCCA loss on a small shared latent subspace
+            if self.use_dcca:
+                z_A_shared = z_A[:, :self.dcca_latent_dim]
+                z_B_shared = z_B[:, :self.dcca_latent_dim]
+                # Encourage the first dcca_latent_dim dimensions to capture shared signal
+                z_A_dcca, z_B_dcca = self.dcca(z_A_shared, z_B_shared)
+                loss_DCCA = deep_cca_loss(
+                    z_A_shared,
+                    z_B_shared,
+                    z_A_dcca,
+                    z_B_dcca,
+                    r1=self.dcca_r1,
+                    r2=self.dcca_r2,
+                    use_all_singular_values=self.dcca_use_all_singular_values,
+                )
+            else:
+                loss_DCCA = torch.tensor(0.0, device=self.device)
+            
+            # Step 3: Generate cross-modal data using encoder representations
             x_AtoB = self.G_B(z_A)
             x_BtoA = self.G_A(z_B)
             
@@ -184,25 +177,9 @@ class Model(object):
             z_AtoB_encoder = self.E_B(x_AtoB)
             z_BtoA_encoder = self.E_A(x_BtoA)
             
-            # Step 6: Pass encoded cross-modal data through DCCA (if enabled)
-            # For latent alignment: z_A should align with DCCA(z_AtoB_encoder, z_B_encoder)
-            # and z_B should align with DCCA(z_A_encoder, z_BtoA_encoder)
-            if self.use_dcca:
-                # Compute DCCA for cross-modal generated data
-                # z_AtoB_dcca is the DCCA representation when we encode generated B from A
-                # We pair it with z_B_encoder to get the DCCA transformation
-                z_AtoB_dcca, _ = self.dcca(z_AtoB_encoder, z_B_encoder)
-                # z_BtoA_dcca is the DCCA representation when we encode generated A from B  
-                # We pair it with z_A_encoder to get the DCCA transformation
-                _, z_BtoA_dcca = self.dcca(z_A_encoder, z_BtoA_encoder)
-                
-                # Use DCCA representations for latent alignment
-                z_AtoB = z_AtoB_dcca
-                z_BtoA = z_BtoA_dcca
-            else:
-                # Use encoder representations directly if DCCA is disabled
-                z_AtoB = z_AtoB_encoder
-                z_BtoA = z_BtoA_encoder
+            # Step 6: Use encoder representations directly for latent alignment
+            z_AtoB = z_AtoB_encoder
+            z_BtoA = z_BtoA_encoder
             
             # Compute kernels for geometric structure loss
             K_A = torch.mean((x_A.view(self.batch_size, 1, -1) - x_A.view(1, self.batch_size, -1))**2, dim=2)
@@ -246,13 +223,6 @@ class Model(object):
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
 
-            # DCCA correlation loss (if enabled)
-            loss_DCCA = 0
-            if self.use_dcca:
-                loss_DCCA = deep_cca_loss(z_A_encoder, z_B_encoder, z_A_dcca, z_B_dcca,
-                                         r1=self.dcca_r1, r2=self.dcca_r2,
-                                         use_all_singular_values=self.dcca_use_all_singular_values)
-
             optimizer_G.zero_grad()
             
             # Combine all losses with scheduled DCCA weight
@@ -275,7 +245,10 @@ class Model(object):
                     self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN)
                 
                 if self.use_dcca:
-                    log_message += ", loss_DCCA=%f (lambda=%.4f)" % (current_lambda_dcca * loss_DCCA, current_lambda_dcca)
+                    log_message += ", loss_DCCA=%f (lambda=%.4f)" % (
+                        current_lambda_dcca * loss_DCCA.detach().item(),
+                        current_lambda_dcca,
+                    )
                 
                 print(log_message)
 

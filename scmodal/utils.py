@@ -22,53 +22,44 @@ class DeepCCA(nn.Module):
     Takes encoder latent representations and learns correlated features by
     maximizing the sum of canonical correlations between the two modalities.
     """
-    def __init__(self, input_dim1, input_dim2, latent_dim, hidden_dims=[512, 256], use_batch_norm=True):
+    def __init__(
+        self,
+        input_dim1,
+        input_dim2,
+        latent_dim,
+        hidden_dims=None,
+        use_batch_norm=False,
+        dropout=0.1,
+    ):
         super(DeepCCA, self).__init__()
         self.latent_dim = latent_dim
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
+        hidden_dims = list(hidden_dims)
+        self.use_batch_norm = use_batch_norm
+        self.dropout = dropout
         
         # Transformation network for modality A (encoder latent -> DCCA latent)
-        transform_layers_A = []
-        prev_dim = input_dim1
-        for hidden_dim in hidden_dims:
-            if use_batch_norm:
-                transform_layers_A.extend([
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
-            else:
-                transform_layers_A.extend([
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
-            prev_dim = hidden_dim
-        transform_layers_A.append(nn.Linear(prev_dim, latent_dim))
-        self.transform_A = nn.Sequential(*transform_layers_A)
+        self.transform_A = self._build_projection(input_dim1, hidden_dims, latent_dim)
         
         # Transformation network for modality B (encoder latent -> DCCA latent)
-        transform_layers_B = []
-        prev_dim = input_dim2
+        self.transform_B = self._build_projection(input_dim2, hidden_dims, latent_dim)
+    
+    def _build_projection(self, input_dim, hidden_dims, output_dim):
+        layers = []
+        prev_dim = input_dim
         for hidden_dim in hidden_dims:
-            if use_batch_norm:
-                transform_layers_B.extend([
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if self.use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
             else:
-                transform_layers_B.extend([
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.ReLU())
+            if self.dropout and self.dropout > 0.0:
+                layers.append(nn.Dropout(self.dropout))
             prev_dim = hidden_dim
-        transform_layers_B.append(nn.Linear(prev_dim, latent_dim))
-        self.transform_B = nn.Sequential(*transform_layers_B)
+        layers.append(nn.Linear(prev_dim, output_dim))
+        return nn.Sequential(*layers)
         
     def forward(self, z1, z2):
         z1_dcca = self.transform_A(z1)
