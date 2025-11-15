@@ -14,9 +14,9 @@ from scmodal.utils import *
 class Model(object):
     def __init__(self, batch_size=500, training_steps=10000, seed=1234, n_latent=20,
                  lambdaAE = 10.0, lambdaLA = 10.0, lambdaMNN = 1.0, lambdaGeo = 10.0, 
-                 lambdaGAN = 1.0, lambdaDCCA = 0.5, n_KNN = 30, use_dcca=False,
-                 dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=True,
-                 model_path="models", data_path="data", result_path="results"):
+                 lambdaGAN = 1.0, lambdaDCCA = 0.05, n_KNN = 30, use_dcca=False,
+                 dcca_r1=1e-5, dcca_r2=1e-5, dcca_use_all_singular_values=False,
+                 dcca_warmup_steps=1000, model_path="models", data_path="data", result_path="results"):
 
         # add device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -42,6 +42,7 @@ class Model(object):
         self.dcca_r1 = dcca_r1  # DCCA regularization parameter for modality 1
         self.dcca_r2 = dcca_r2  # DCCA regularization parameter for modality 2
         self.dcca_use_all_singular_values = dcca_use_all_singular_values  # Use all singular values in DCCA loss
+        self.dcca_warmup_steps = dcca_warmup_steps  # Steps to train DCCA before freezing
         self.model_path = model_path
         self.data_path = data_path
         self.result_path = result_path
@@ -119,8 +120,17 @@ class Model(object):
 
         N_A = self.emb_A.shape[0]
         N_B = self.emb_B.shape[0]
+        
+        # Track if DCCA has been frozen
+        dcca_frozen = False
 
         for step in range(self.training_steps):
+            # Freeze DCCA after warmup to prevent it from dominating other losses
+            if self.use_dcca and step == self.dcca_warmup_steps and not dcca_frozen:
+                self.dcca.freeze()
+                dcca_frozen = True
+                print(f"🔒 DCCA frozen at step {step} to allow other losses to recover")
+            
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)

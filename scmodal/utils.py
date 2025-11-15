@@ -74,6 +74,16 @@ class DeepCCA(nn.Module):
         z1_dcca = self.transform_A(z1)
         z2_dcca = self.transform_B(z2)
         return z1_dcca, z2_dcca
+    
+    def freeze(self):
+        """Freeze all DCCA parameters to stop gradient updates"""
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def unfreeze(self):
+        """Unfreeze all DCCA parameters to allow gradient updates"""
+        for param in self.parameters():
+            param.requires_grad = True
 
 
 def deep_cca_loss(z1_encoder, z2_encoder, z1_dcca, z2_dcca, r1=1e-5, r2=1e-5, use_all_singular_values=True):
